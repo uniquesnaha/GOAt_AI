@@ -1,0 +1,33 @@
+# data (see DATA_SETUP.md)
+data/**
+!data/**/
+!data/**/.gitkeep
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# env
+.env
+deploy/.env
+*.local
+
+# model / vector db caches
+qdrant_storage/
+hf_cache/
+
+# benchmark outputs
+full_rag_t4_results/
+*.csv
+
+# os
+.DS_Store
+Thumbs.db

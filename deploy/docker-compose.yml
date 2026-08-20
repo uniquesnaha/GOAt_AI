@@ -1,0 +1,51 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.10.1
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_GRPC_PORT: "6334"
+      GOAT_DATA_ROOT: /data
+      SARVAM_API_KEY: ${SARVAM_API_KEY:-}
+      GOAT_CORS_ORIGINS: '["*"]'
+    volumes:
+      - ../data:/data
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "8000:8000"
+    # Requires the NVIDIA Container Toolkit on the host (see deploy/gcloud/README.md).
+    gpus: all
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+
+volumes:
+  qdrant_storage:
+  hf_cache:
