@@ -70,44 +70,59 @@ cp deploy/.env.example deploy/.env
 # edit deploy/.env and set SARVAM_API_KEY
 ```
 
-## 6. Index Qdrant, then run the parity gate
-
-Do this once per fresh Qdrant volume, before serving traffic:
+## 6. Build images, then index Qdrant, then run the parity gate
 
 ```bash
-cd ~/GOAt_AI/backend
-docker compose -f ../deploy/docker-compose.yml up -d qdrant
-# from inside a Python env with backend/requirements.txt installed and GOAT_DATA_ROOT set:
-python -m app.indexing.index_qdrant
-python -m parity.test_parity
+cd ~/GOAt_AI/deploy
+docker compose --env-file .env up -d qdrant
+docker compose --env-file .env build backend
+
+# sanity check the GPU is actually visible to the container first:
+docker compose --env-file .env run --rm backend \
+  python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# must print: True Tesla T4  (or your GPU's name) — do not continue if it says False
+
+docker compose --env-file .env run --rm backend python -m app.indexing.index_qdrant
+docker compose --env-file .env run --rm backend python -m parity.test_parity
 ```
 
-(Running the indexer/parity gate directly with a local Python env — rather
-than inside the backend container — is usually faster to iterate on; the
-container will pick up the already-populated Qdrant volume when it starts.)
+`backend`'s container mounts `../scripts` read-only, so the parity gate can
+load the untouched golden script from inside the container and compare it
+against `app.rag.engine` — same dense/BM25/fused parent IDs, same context
+string, same prompt tokens, same generated answer. If it fails, that's a
+packaging bug to fix, not a reason to retune the RAG.
+
+Qdrant's ports are published to `127.0.0.1` only (not the public interface),
+so they're reachable from this VM but never from the internet — this is
+true defense in depth, independent of your firewall rules.
 
 ## 7. Bring everything up
 
 ```bash
 cd ~/GOAt_AI/deploy
 docker compose --env-file .env up -d --build
+docker compose ps
 ```
 
-Check readiness:
+`qdrant`, `backend`, and `frontend` should all show `healthy` — backend's
+healthcheck hits `/readyz` (can take a few minutes on first boot while the
+Qwen models download), frontend's depends on backend being healthy first.
 
 ```bash
-curl http://localhost:8000/readyz
+curl http://127.0.0.1:8000/readyz   # from the VM; backend isn't published publicly
 ```
 
-The frontend is served on port 80. If you attached a static IP / DNS name,
-point it there; otherwise use the VM's external IP.
+The frontend is served on port 80 (the only public surface — backend/Qdrant
+ports are loopback-only). If you attached a static IP / DNS name, point it
+there; otherwise use the VM's external IP.
 
 ## 8. Generate the latency submission numbers
 
 ```bash
-cd ~/GOAt_AI/backend
-python -m benchmarks.benchmark_full_rag --per-language 50
-curl http://localhost:8000/api/metrics
+cd ~/GOAt_AI/deploy
+docker compose --env-file .env exec backend \
+  python -m benchmarks.benchmark_full_rag --per-language 50
+curl http://127.0.0.1:8000/api/metrics
 ```
 
 This reproduces the same P50/P70/P90/P95/P100 report the golden script

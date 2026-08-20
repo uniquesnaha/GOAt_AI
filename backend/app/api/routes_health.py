@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 from app.config import settings
 
@@ -14,22 +15,32 @@ def healthz() -> dict:
 
 
 @router.get("/readyz")
-def readyz(request: Request) -> dict:
+def readyz(request: Request) -> JSONResponse:
+    # Non-2xx on "not ready" is deliberate: docker-compose's `curl -f`
+    # healthcheck (see deploy/docker-compose.yml) only fails on HTTP error
+    # status, not on response body content — a 200 here would always read
+    # as "healthy" even while the engine is still loading or Qdrant is down.
     engine = getattr(request.app.state, "engine", None)
     load_error = getattr(request.app.state, "engine_load_error", None)
 
     if engine is None:
-        return {
-            "status": "not_ready",
-            "reason": load_error or "models/data not loaded yet — see DATA_SETUP.md",
-        }
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "reason": load_error or "models/data not loaded yet — see DATA_SETUP.md",
+            },
+        )
 
     try:
         engine.qdrant.get_collections()
     except Exception as exc:
-        return {"status": "not_ready", "reason": f"Qdrant unreachable: {exc}"}
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "reason": f"Qdrant unreachable: {exc}"},
+        )
 
-    return {"status": "ready"}
+    return JSONResponse(status_code=200, content={"status": "ready"})
 
 
 @router.get("/api/metrics")

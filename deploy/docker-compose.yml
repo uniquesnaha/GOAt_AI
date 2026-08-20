@@ -3,8 +3,11 @@ services:
     image: qdrant/qdrant:v1.10.1
     restart: unless-stopped
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      # Loopback-only: reachable from this VM (e.g. a host-side Python venv,
+      # or `ssh -L`), never from the public internet regardless of firewall
+      # rules. Nothing outside this compose network needs direct Qdrant access.
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
     volumes:
       - qdrant_storage:/qdrant/storage
     healthcheck:
@@ -31,10 +34,27 @@ services:
     volumes:
       - ../data:/data
       - hf_cache:/root/.cache/huggingface
+      # Golden reference, read-only. Needed so `docker compose exec backend
+      # python -m parity.test_parity` can dynamically load the untouched
+      # scripts/benchmark_full_rag_t4_latency_winner.py for comparison — it
+      # isn't otherwise part of the backend's own build context.
+      - ../scripts:/app/scripts:ro
     ports:
-      - "8000:8000"
+      # Loopback-only, same reasoning as qdrant above — only nginx (in this
+      # same compose network) needs to reach the backend; the public surface
+      # is the frontend on 80/443.
+      - "127.0.0.1:8000:8000"
     # Requires the NVIDIA Container Toolkit on the host (see deploy/gcloud/README.md).
     gpus: all
+    healthcheck:
+      # /readyz reflects true readiness (models loaded + Qdrant reachable),
+      # not just "process is up" — model downloads/loading can take minutes
+      # on first boot, hence the long start_period.
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 300s
 
   frontend:
     build:
@@ -42,9 +62,16 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     ports:
       - "80:80"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
 
 volumes:
   qdrant_storage:
