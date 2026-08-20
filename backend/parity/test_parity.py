@@ -70,7 +70,16 @@ def _ensure_golden_root_link() -> None:
             f"data."
         )
 
-    GOLDEN_ROOT.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        GOLDEN_ROOT.parent.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"Can't create {GOLDEN_ROOT.parent} — it's a filesystem-root "
+            f"path and your user likely lacks permission. One-time fix:\n"
+            f"    sudo mkdir -p {GOLDEN_ROOT.parent}\n"
+            f"    sudo chown $USER:$USER {GOLDEN_ROOT.parent}\n"
+            f"then re-run this."
+        ) from exc
 
     if os.name == "nt":
         os.system(f'mklink /J "{GOLDEN_ROOT}" "{data_root}"')
