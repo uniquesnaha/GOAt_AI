@@ -1,7 +1,12 @@
-# --- RAG engine (unchanged versions the golden script was built against) ---
-torch==2.4.0
+# --- RAG engine ---
+# torch must stay >=2.5 — recent transformers releases hard-require it, and
+# transformers itself must stay recent enough to recognize the Qwen3
+# architecture (GEN_MODEL below). Neither pin is a RAG-logic choice, just
+# packaging plumbing — see backend/parity/test_parity.py for what actually
+# has to match the golden reference.
+torch==2.5.1
 sentence-transformers>=3.0.0
-transformers>=4.44.0
+transformers>=4.51.0
 bm25s>=0.2.0
 qdrant-client>=1.10.0
 numpy>=1.26,<2.0

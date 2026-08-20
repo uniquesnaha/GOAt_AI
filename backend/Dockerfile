@@ -1,4 +1,7 @@
-# CUDA 12.1 + cuDNN runtime, matching torch==2.4.0's default CUDA build.
+# CUDA 12.1 + cuDNN runtime. torch's PyPI wheel bundles its own CUDA runtime
+# libs (nvidia-*-cu12 packages) independent of this base image's toolkit
+# version, so this only needs to be new enough for the driver's compat
+# range — confirmed working against driver 580.x / CUDA 13.0 on an L4.
 # Works on GCP L4/T4 GPU VMs with a recent NVIDIA driver + nvidia-container-toolkit.
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
