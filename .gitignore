@@ -1,7 +1,4 @@
-# data (see DATA_SETUP.md)
-data/**
-!data/**/
-!data/**/.gitkeep
+
 
 # python
 __pycache__/

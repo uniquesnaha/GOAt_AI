@@ -1,0 +1,18 @@
+{
+  "strategy": "fixed_384_96",
+  "language": "ta",
+  "model": "Qwen/Qwen3-Embedding-0.6B",
+  "dimension": 256,
+  "normalized": true,
+  "max_seq_length": 1024,
+  "batch_size": 32,
+  "chunks": 40382,
+  "parents": 25000,
+  "runtime_seconds": 1307.67463614,
+  "runtime_minutes": 21.794577269,
+  "chunks_per_second": 30.88077024970047,
+  "embedding_shape": [
+    40382,
+    256
+  ]
+}
