@@ -191,12 +191,9 @@ HNSW_EF = 64
 CONTEXT_CHAR_BUDGET = 350
 MAX_CONTEXT_PARENTS = 2
 
-# 168 guarantees two blocks fit inside the 350-char budget:
-# "[1] " + 168 = 172
-# "\n\n"       =   2
-# "[2] " + 168 = 172
-#                ───
-#                346
+# Two 168-character evidence blocks plus their separator use 338 characters.
+# Source numbering is intentionally UI metadata, not generator input: the
+# 0.6B model otherwise tends to emit only "[1]" instead of the answer span.
 PER_CHUNK_CHARS = 168
 
 # 16 was too easy to truncate Tamil/Hindi answers.
@@ -1000,10 +997,10 @@ class ContextStore:
                 per_chunk_chars,
             )
 
-            block = (
-                f"[{len(blocks)+1}] "
-                f"{snippet}"
-            )
+            # Source numbers remain in used_evidence/UI metadata. Do not put
+            # them in the generator prompt: the small model can mistake the
+            # label itself for the requested shortest answer span.
+            block = snippet
 
             if (
                 used
@@ -1589,71 +1586,36 @@ class FullRAG:
             time.perf_counter()
         )
 
-        system_message = (
-            "Extract the shortest answer span from E that answers Q. "
-            "Return only that span in Q's language. "
-            "If E has no answer span, return NOT_FOUND."
-        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Answer only from C. "
+                    "Reply briefly in the language of Q. "
+                    "If unsupported, reply NOT_FOUND."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"C:\n{context}\n"
+                    f"Q:\n{query}"
+                ),
+            },
+        ]
 
-        def render_prompt(evidence):
-            messages = [
-                {
-                    "role": "system",
-                    "content": system_message,
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"E:\n{evidence}\n"
-                        f"Q:\n{query}\n"
-                        "A:"
-                    ),
-                },
-            ]
+        prompt = (
+            self.gen_tokenizer
+            .apply_chat_template(
+                messages,
 
-            return (
-                self.gen_tokenizer
-                .apply_chat_template(
-                    messages,
+                tokenize=False,
 
-                    tokenize=False,
+                add_generation_prompt=True,
 
-                    add_generation_prompt=True,
-
-                    enable_thinking=False,
-                )
+                enable_thinking=False,
             )
-
-        # Preserve the proven E -> Q causal order without allowing the
-        # 512-token ceiling to remove Q. Budget evidence tokens explicitly,
-        # leaving a small margin for chat-template boundary tokens.
-        prompt_without_evidence = render_prompt("")
-
-        base_token_count = len(
-            self.gen_tokenizer(
-                prompt_without_evidence,
-                add_special_tokens=False,
-            )["input_ids"]
         )
-
-        evidence_token_budget = max(
-            0,
-            512 - base_token_count - 8,
-        )
-
-        evidence_ids = self.gen_tokenizer(
-            context,
-            add_special_tokens=False,
-        )["input_ids"]
-
-        if len(evidence_ids) > evidence_token_budget:
-            context = self.gen_tokenizer.decode(
-                evidence_ids[:evidence_token_budget],
-                skip_special_tokens=True,
-            )
-
-        prompt = render_prompt(context)
-
 
         inputs = (
             self.gen_tokenizer(
@@ -1670,6 +1632,7 @@ class FullRAG:
             )
             .to("cuda")
         )
+
 
         prompt_tokens = int(
             inputs["input_ids"].shape[1]

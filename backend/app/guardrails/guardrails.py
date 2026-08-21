@@ -220,12 +220,23 @@ def apply_output_guardrail(
 
     cleaned = _clean_answer(stripped)
 
-    if possibly_truncated or "�" in cleaned:
+    # Reject only if the answer both hit the token ceiling AND ends mid-word.
+    # Tamil/Hindi short answers (e.g. "புதுதில்லி", "100 डिग्री सेल्सियस")
+    # regularly use all 24 tokens because Indic scripts tokenize at ~1 char/token.
+    # Rejecting on token count alone would silently suppress valid answers.
+    mid_word_truncation = (
+        possibly_truncated
+        and bool(stripped)
+        and stripped[-1] not in " \t\n.,!?।॥\u0964\u0965\"')"
+    )
+
+    if mid_word_truncation or "â" in cleaned:
         return _localized_rejection(
             language,
             "truncated_answer",
             "Model output reached its token limit or ended mid-token.",
         )
+
 
     answer_terms = _terms(cleaned)
     for left, middle, right in zip(
