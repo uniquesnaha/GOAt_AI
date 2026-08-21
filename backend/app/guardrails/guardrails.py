@@ -120,12 +120,21 @@ def _terms(text: str) -> list[str]:
     return terms
 
 
+_MCQ_PREFIX_RE = re.compile(
+    r"^[A-Da-d][.)]\s*",
+)
+
+
 def _clean_answer(answer: str) -> str:
     cleaned = str(answer).strip()
     cleaned = cleaned.replace("**", "")
     cleaned = _CITATION_RE.sub("", cleaned)
+    # Strip MCQ option prefixes (A. B. C. D.) — the 0.6B model generates these
+    # when evidence contains numbered lists that look like answer choices.
+    cleaned = _MCQ_PREFIX_RE.sub("", cleaned)
     cleaned = " ".join(cleaned.split())
     return cleaned.strip(" -–—:;,.|")
+
 
 
 def _supported_by_context(answer: str, context: str) -> bool:
@@ -220,21 +229,16 @@ def apply_output_guardrail(
 
     cleaned = _clean_answer(stripped)
 
-    # Reject only if the answer both hit the token ceiling AND ends mid-word.
-    # Tamil/Hindi short answers (e.g. "புதுதில்லி", "100 डिग्री सेल्सियस")
-    # regularly use all 24 tokens because Indic scripts tokenize at ~1 char/token.
-    # Rejecting on token count alone would silently suppress valid answers.
-    mid_word_truncation = (
-        possibly_truncated
-        and bool(stripped)
-        and stripped[-1] not in " \t\n.,!?।॥\u0964\u0965\"')"
-    )
-
-    if mid_word_truncation or "â" in cleaned:
+    # Only reject on actual Unicode corruption (U+FFFD replacement character).
+    # The possibly_truncated flag (generated_tokens == MAX_NEW_TOKENS) is NOT
+    # a reliable signal: Hindi words ending in consonants (एवरेस्ट, महासागर)
+    # and Tamil words ending in vowel signs (புதுதில்லி) are complete answers
+    # that legitimately use all tokens. Token count alone must not reject them.
+    if "\ufffd" in cleaned:
         return _localized_rejection(
             language,
             "truncated_answer",
-            "Model output reached its token limit or ended mid-token.",
+            "Model output contained a Unicode corruption marker.",
         )
 
 

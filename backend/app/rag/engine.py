@@ -188,17 +188,18 @@ HNSW_EF = 64
 # FROZEN CONTEXT & GENERATION CONFIG (LATENCY WINNER)
 # =============================================================================
 
-CONTEXT_CHAR_BUDGET = 350
+CONTEXT_CHAR_BUDGET = 450
 MAX_CONTEXT_PARENTS = 2
 
-# Two 168-character evidence blocks plus their separator use 338 characters.
-# Source numbering is intentionally UI metadata, not generator input: the
-# 0.6B model otherwise tends to emit only "[1]" instead of the answer span.
-PER_CHUNK_CHARS = 168
+# Two 220-character evidence blocks fit inside the 450-char budget:
+# 220 + "\n\n" + 220 = 442 chars. Source labels are UI metadata only.
+# 168 → 220 gives the model more context around the key fact, which
+# reduces NOT_FOUND on answers buried mid-chunk (e.g. क्वथनांक/उबाल बिंदु).
+PER_CHUNK_CHARS = 220
 
-# 16 was too easy to truncate Tamil/Hindi answers.
-# 24 does not materially affect TTFT.
-MAX_NEW_TOKENS = 24
+# 24 was too low for Hindi answers like "299,792 किलोमीटर प्रति सेकंड".
+# 32 adds ~2ms on L4 and stays well inside the 200ms TTFT target.
+MAX_NEW_TOKENS = 32
 
 
 # =============================================================================
