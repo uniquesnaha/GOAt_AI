@@ -188,14 +188,13 @@ HNSW_EF = 64
 # FROZEN CONTEXT & GENERATION CONFIG (LATENCY WINNER)
 # =============================================================================
 
-CONTEXT_CHAR_BUDGET = 350
-MAX_CONTEXT_PARENTS = 1
+CONTEXT_CHAR_BUDGET = 450
+MAX_CONTEXT_PARENTS = 2
 
-# A single clean 350-character evidence block from the top-ranked retrieved
-# parent. Focusing the 0.6B generator on the #1 hybrid winner eliminates
-# multi-passage distractor confusion (e.g. picking 19,400,000 miles over 8 planets,
-# or Rocky Mountains over Everest), lowers prompt tokens, and keeps TTFT fast (~120-140ms).
-PER_CHUNK_CHARS = 350
+# Two 220-character evidence blocks fit inside the 450-char budget:
+# 220 + "\n\n" + 220 = 442 chars. Snapped to word boundaries to prevent
+# broken letter artifacts. Provides 2-source coverage for complex questions.
+PER_CHUNK_CHARS = 220
 
 # 32 tokens ensures full answers are generated without truncation.
 MAX_NEW_TOKENS = 32
@@ -1606,19 +1605,21 @@ class FullRAG:
             {
                 "role": "system",
                 "content": (
-                    "Answer only from C. "
-                    "Reply briefly in the language of Q. "
-                    "If unsupported, reply NOT_FOUND."
+                    "Extract the factual answer to Q from the context C. "
+                    "Output only the short answer in the language of Q. "
+                    "If C has completely no related information, output NOT_FOUND."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"C:\n{context}\n"
-                    f"Q:\n{query}"
+                    f"Q:\n{query}\n\n"
+                    f"C:\n{context}\n\n"
+                    "A:"
                 ),
             },
         ]
+
 
         prompt = (
             self.gen_tokenizer
@@ -1644,7 +1645,7 @@ class FullRAG:
                     True,
 
                 max_length=
-                    2048,
+                    850,
             )
             .to("cuda")
         )
@@ -1654,11 +1655,12 @@ class FullRAG:
             inputs["input_ids"].shape[1]
         )
 
-        if prompt_tokens >= 1800:
+        if prompt_tokens >= 800:
             print(
                 f"⚠️ Prompt near truncation: "
                 f"{prompt_tokens} tokens"
             )
+
 
 
         prep_ms = (

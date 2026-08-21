@@ -124,6 +124,11 @@ _MCQ_PREFIX_RE = re.compile(
     r"^[A-Da-d][.)]\s*",
 )
 
+_ANSWER_PREFIX_RE = re.compile(
+    r"^(?:A|Answer|Ans|उत्तर|பதில்)\s*[:\-–]\s*",
+    re.IGNORECASE,
+)
+
 
 def _clean_answer(answer: str) -> str:
     cleaned = str(answer).strip()
@@ -132,10 +137,13 @@ def _clean_answer(answer: str) -> str:
     # Strip MCQ option prefixes (A. B. C. D.) — the 0.6B model generates these
     # when evidence contains numbered lists that look like answer choices.
     cleaned = _MCQ_PREFIX_RE.sub("", cleaned)
+    # Strip A: / Answer: prefixes
+    cleaned = _ANSWER_PREFIX_RE.sub("", cleaned)
     # Sanitize Unicode replacement character instead of rejecting the whole answer
     cleaned = cleaned.replace("\ufffd", "")
     cleaned = " ".join(cleaned.split())
     return cleaned.strip(" -–—:;,.|")
+
 
 
 
