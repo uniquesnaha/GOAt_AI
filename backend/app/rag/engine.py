@@ -45,21 +45,66 @@ from app.config import settings
 
 
 # =============================================================================
-# PATHS
+# ACTIVE CORPUS PROFILE
 # =============================================================================
 
-ROOT = Path(settings.data_root)
+CORPUS_PROFILE = (
+    settings.corpus_profile
+    .strip()
+    .lower()
+)
+
+if CORPUS_PROFILE == "25k":
+
+    CHUNK_ROOT = (
+        ROOT
+        / "chunks_25k"
+        / "fixed_384_96"
+    )
+
+    ACTIVE_COLLECTIONS = {
+        "ta":
+            "hhgoa_fixed384_ta",
+
+        "hi":
+            "hhgoa_fixed384_hi",
+    }
+
+elif CORPUS_PROFILE == "350k":
+
+    CHUNK_ROOT = (
+        ROOT
+        / "chunks_350k"
+        / "fixed_384_96"
+    )
+
+    ACTIVE_COLLECTIONS = {
+        "ta":
+            "hhgoa_350k_fixed384_ta",
+
+        "hi":
+            "hhgoa_350k_fixed384_hi",
+    }
+
+else:
+
+    raise RuntimeError(
+        "GOAT_CORPUS_PROFILE must be "
+        "'25k' or '350k', got "
+        f"{CORPUS_PROFILE!r}"
+    )
+
 
 CHUNKS = {
     "ta":
-        ROOT / "chunks_25k"
-        / "fixed_384_96"
-        / "tamil.parquet",
+        CHUNK_ROOT
+        /
+        "tamil.parquet",
 
     "hi":
-        ROOT / "chunks_25k"
-        / "fixed_384_96"
-        / "hindi.parquet",
+        CHUNK_ROOT
+        /
+        "hindi.parquet",
 }
 
 
@@ -81,7 +126,9 @@ QUERY_MAX_LENGTH = 256
 CFG = {
     "ta": {
         "collection":
-            "hhgoa_fixed384_ta",
+            ACTIVE_COLLECTIONS[
+                "ta"
+            ],
 
         "bm25_k1":
             0.90,
@@ -101,7 +148,9 @@ CFG = {
 
     "hi": {
         "collection":
-            "hhgoa_fixed384_hi",
+            ACTIVE_COLLECTIONS[
+                "hi"
+            ],
 
         "bm25_k1":
             2.00,

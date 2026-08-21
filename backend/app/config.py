@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, validation_alias="GOAT_PORT")
 
     cors_origins: list[str] = Field(default_factory=lambda: ["*"], validation_alias="GOAT_CORS_ORIGINS")
+    corpus_profile: str = Field(default="25k", validation_alias="GOAT_CORPUS_PROFILE")
 
 
 settings = Settings()
