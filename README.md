@@ -5,12 +5,13 @@ A Tamil/Hindi grounded RAG assistant — Qwen embedder + Qwen generator, dense
 deployable backend + frontend with Sarvam streaming speech-to-text and
 guardrails on top.
 
-**The RAG logic itself is untouched.** `scripts/benchmark_full_rag_t4_latency_winner.py`
-is the golden reference that produced the winning ~143ms P50 / 20-of-20
-under-200ms result — it stays byte-identical forever. Everything under
-`backend/`, `frontend/`, and `deploy/` packages that logic for real
-deployment; it never redesigns it. See `backend/parity/test_parity.py` for
-the mechanical proof the two stay behaviorally identical.
+**The validated hybrid retrieval stack and ranking configuration are frozen.**
+`scripts/benchmark_full_rag_t4_latency_winner.py` is the golden reference
+that produced the winning ~143ms P50 result — it stays byte-identical forever.
+A post-retrieval grounded-evidence packing layer improves answer quality while
+preserving the same Top-20 retrieval ranking. See
+`backend/parity/test_retrieval_parity.py` for the mechanical proof the
+retrieval ranking is unchanged by the quality patch.
 
 ## Architecture
 
@@ -51,8 +52,9 @@ the mechanical proof the two stay behaviorally identical.
   health/readiness/metrics).
 - `backend/benchmarks/benchmark_full_rag.py` — the offline P50/P70/P90/P95/P100
   + recall/hit measurement, same math as the golden script.
-- `backend/parity/test_parity.py` — deployment gate comparing golden vs.
-  modular output.
+- `backend/parity/test_retrieval_parity.py` — deployment gate comparing golden
+  vs. modular retrieval Top-20 output (retrieval parity only; post-retrieval
+  quality layer intentionally improves context and answer).
 - `frontend/` — React + Vite + TypeScript + Tailwind chat UI ("GOAt AI"),
   language switch, mic streaming, per-stage latency + guardrail badges.
 - `deploy/` — docker-compose (Qdrant + backend + frontend) and a GCP GPU-VM
@@ -68,8 +70,8 @@ pip install -r requirements.txt
 export GOAT_DATA_ROOT=$(pwd)/../data
 python -m app.indexing.index_qdrant
 
-# 2. (recommended) prove the modular engine matches the golden script
-python -m parity.test_parity
+# 2. (recommended) prove retrieval ranking matches the golden script
+python -m parity.test_retrieval_parity
 
 # 3. Run the backend
 export SARVAM_API_KEY=...        # for streaming STT
@@ -103,9 +105,9 @@ For a full GCP GPU VM deployment, see `deploy/gcloud/README.md`.
    golden reference. `DATA_SETUP.md` documents how to add further chunking
    strategies as additional `CHUNKS`/`CFG` entries without touching the
    retrieval math.
-3. **Latency target (<200ms)** — the frozen `CONTEXT_CHAR_BUDGET=350`,
-   `MAX_NEW_TOKENS=16`, and retrieval depths are exactly what produced
-   20-of-20 queries under 200ms in the golden run.
+3. **Latency target (<200ms)** — the frozen retrieval configuration
+   (`CONTEXT_CHAR_BUDGET=350`, `MAX_NEW_TOKENS=24`, retrieval depths)
+   targets <200ms TTFT. Complete-response latency is reported separately.
 4. **Latency analytics** — `backend/benchmarks/benchmark_full_rag.py` reports
    P50/P70/P90/P95/P100 across 100+ deterministic queries; also exposed live
    via `GET /api/metrics`.

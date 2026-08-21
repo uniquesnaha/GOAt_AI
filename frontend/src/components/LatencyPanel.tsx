@@ -10,7 +10,9 @@ const STAGE_LABELS: [keyof StageLatencies, string][] = [
   ["prompt_prep_ms", "Prompt prep"],
   ["model_first_token_ms", "Model first token"],
   ["generation_ttft_ms", "Generation TTFT"],
+  ["generation_complete_ms", "Generation complete"],
   ["full_rag_ttft_ms", "Core RAG TTFT"],
+  ["full_rag_complete_ms", "Core RAG complete"],
   ["request_overhead_ms", "Request overhead"],
 ];
 

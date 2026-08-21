@@ -343,13 +343,13 @@ def main():
     parser.add_argument(
         "--per-chunk-chars",
         type=int,
-        default=175,
+        default=168,
     )
 
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=16,
+        default=24,
     )
 
     args = parser.parse_args()
@@ -459,6 +459,7 @@ def main():
             context,
             context_ms,
             context_parents,
+            _,
         ) = (
             engine.contexts.build(
                 row["language"],
@@ -467,6 +468,11 @@ def main():
                 args.context_char_budget,
                 args.max_context_parents,
                 args.per_chunk_chars,
+                evidence_by_parent=
+                    retrieval.get(
+                        "evidence_by_parent",
+                        {},
+                    ),
             )
         )
 
@@ -532,6 +538,7 @@ def main():
             context,
             context_ms,
             context_parents,
+            used_evidence,
         ) = (
             engine.contexts.build(
                 row["language"],
@@ -540,6 +547,11 @@ def main():
                 args.context_char_budget,
                 args.max_context_parents,
                 args.per_chunk_chars,
+                evidence_by_parent=
+                    retrieval.get(
+                        "evidence_by_parent",
+                        {},
+                    ),
             )
         )
 
@@ -553,9 +565,18 @@ def main():
         )
 
 
+        # Correction 2: use absolute timestamps directly.
         full_ttft = (
             generation[
                 "first_token_at"
+            ]
+            -
+            overall_start
+        ) * 1000
+
+        full_complete = (
+            generation[
+                "completed_at"
             ]
             -
             overall_start
@@ -566,6 +587,37 @@ def main():
             row[
                 "relevant_parent_ids"
             ]
+        )
+
+        # Packed evidence hit: did a labelled-relevant parent actually
+        # make it into the Qwen context window?
+        relevant_set = set(relevant)
+        used_parent_ids = {
+            e["parent_id"]
+            for e in used_evidence
+        }
+        packed_hit = bool(
+            used_parent_ids & relevant_set
+        )
+
+        # False-abstention proxy: relevant evidence packed but Qwen
+        # still returned NOT_FOUND.
+        is_not_found = (
+            generation["answer"]
+            .strip()
+            .upper()
+            .startswith("NOT_FOUND")
+        )
+
+        # Correction 3: token-limit hit only.
+        possibly_truncated = generation.get(
+            "possibly_truncated",
+            False,
+        )
+
+        generated_tokens = generation.get(
+            "generated_tokens",
+            0,
         )
 
 
@@ -594,6 +646,18 @@ def main():
                     ],
                     relevant,
                 ),
+
+            "packed_hit":
+                packed_hit,
+
+            "is_not_found":
+                is_not_found,
+
+            "possibly_truncated":
+                possibly_truncated,
+
+            "generated_tokens":
+                generated_tokens,
 
             "embed_ms":
                 retrieval[
@@ -646,6 +710,9 @@ def main():
 
             "full_rag_ttft_ms":
                 full_ttft,
+
+            "full_rag_complete_ms":
+                full_complete,
 
             "answer":
                 generation[
@@ -708,6 +775,7 @@ def main():
         "model_first_token_ms",
         "generation_ttft_ms",
         "full_rag_ttft_ms",
+        "full_rag_complete_ms",
     ]
 
 
@@ -740,6 +808,94 @@ def main():
     print(
         f"FULL RAG <200 ms: "
         f"{under200:.1f}%"
+    )
+
+
+    # -------------------------------------------------------------------------
+    # GROUNDING / ABSTENTION
+    # -------------------------------------------------------------------------
+
+    print()
+    print("=" * 100)
+    print("GROUNDING / ABSTENTION")
+    print("=" * 100)
+
+    retrieval_hit_rate = (
+        df["hit_20"].mean()
+    )
+
+    packed_hit_rate = (
+        df["packed_hit"].mean()
+    )
+
+    not_found_rate = (
+        df["is_not_found"].mean()
+    )
+
+    false_abstention = (
+        df["packed_hit"]
+        &
+        df["is_not_found"]
+    )
+
+    truncation_rate = (
+        df["possibly_truncated"].mean()
+    )
+
+    answered_when_packed = (
+        df["packed_hit"]
+        &
+        (~df["is_not_found"])
+    )
+
+    packed_hit_count = df["packed_hit"].sum()
+
+    packed_answer_rate = (
+        answered_when_packed.sum()
+        /
+        max(packed_hit_count, 1)
+    )
+
+
+    print(
+        f"{'Retrieval Hit@20':<35}"
+        f"{round(retrieval_hit_rate, 4)}"
+    )
+
+    print(
+        f"{'Packed Evidence Hit':<35}"
+        f"{round(packed_hit_rate, 4)}"
+    )
+
+    print(
+        f"{'NOT_FOUND rate':<35}"
+        f"{round(not_found_rate, 4)}"
+    )
+
+    print(
+        f"{'False-Abstention Proxy':<35}"
+        f"{round(false_abstention.mean(), 4)}"
+    )
+
+    print(
+        f"{'Possible Truncation':<35}"
+        f"{round(truncation_rate, 4)}"
+    )
+
+    print()
+    print(
+        f"Queries with packed relevant evidence : "
+        f"{int(packed_hit_count)}"
+    )
+
+    print(
+        f"Answered (not NOT_FOUND) when packed  : "
+        f"{int(answered_when_packed.sum())}"
+    )
+
+    print(
+        f"Answer rate when relevant evidence packed: "
+        f"{packed_answer_rate:.1%}"
     )
 
 

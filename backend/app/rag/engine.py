@@ -138,8 +138,18 @@ HNSW_EF = 64
 
 CONTEXT_CHAR_BUDGET = 350
 MAX_CONTEXT_PARENTS = 2
-PER_CHUNK_CHARS = 175
-MAX_NEW_TOKENS = 16
+
+# 168 guarantees two blocks fit inside the 350-char budget:
+# "[1] " + 168 = 172
+# "\n\n"       =   2
+# "[2] " + 168 = 172
+#                ───
+#                346
+PER_CHUNK_CHARS = 168
+
+# 16 was too easy to truncate Tamil/Hindi answers.
+# 24 does not materially affect TTFT.
+MAX_NEW_TOKENS = 24
 
 
 # =============================================================================
@@ -229,12 +239,23 @@ class BM25Engine:
                 f"No text column in {path}"
             )
 
+        read_columns = [
+            "parent_id",
+            text_col,
+        ]
+
+        has_chunk_id = (
+            "chunk_id" in schema
+        )
+
+        if has_chunk_id:
+            read_columns.append(
+                "chunk_id"
+            )
+
         df = pd.read_parquet(
             path,
-            columns=[
-                "parent_id",
-                text_col,
-            ],
+            columns=read_columns,
         )
 
         self.parent_ids = (
@@ -243,12 +264,31 @@ class BM25Engine:
             .tolist()
         )
 
-        texts = (
+        self.chunk_texts = (
             df[text_col]
             .fillna("")
             .astype(str)
             .tolist()
         )
+
+        if has_chunk_id:
+
+            self.chunk_ids = (
+                df["chunk_id"]
+                .astype(str)
+                .tolist()
+            )
+
+        else:
+
+            self.chunk_ids = [
+                f"{language}_row_{i}"
+                for i in range(
+                    len(df)
+                )
+            ]
+
+        texts = self.chunk_texts
 
         self.tokenizer = Tokenizer(
             stemmer=None,
@@ -290,7 +330,7 @@ class BM25Engine:
         )
 
 
-    def search(
+    def search_with_evidence(
         self,
         query,
     ):
@@ -320,26 +360,51 @@ class BM25Engine:
 
         parents = []
         seen = set()
+        evidence = {}
 
-        for idx, score in zip(
+        for chunk_index, score in zip(
             indices[0],
             scores[0],
         ):
 
-            if float(score) <= 0:
+            score = float(score)
+
+            if score <= 0:
                 continue
 
-            parent = (
-                self.parent_ids[
-                    int(idx)
-                ]
+            idx = int(chunk_index)
+
+            parent_id = (
+                self.parent_ids[idx]
             )
 
-            if parent in seen:
+            if parent_id in seen:
                 continue
 
-            seen.add(parent)
-            parents.append(parent)
+            seen.add(parent_id)
+            parents.append(parent_id)
+
+            evidence[
+                parent_id
+            ] = {
+                "parent_id":
+                    parent_id,
+
+                "chunk_id":
+                    self.chunk_ids[idx],
+
+                "text":
+                    self.chunk_texts[idx],
+
+                "score":
+                    score,
+
+                "lane":
+                    "bm25",
+
+                "rank":
+                    len(parents),
+            }
 
             if (
                 len(parents)
@@ -348,13 +413,38 @@ class BM25Engine:
             ):
                 break
 
-        ms = (
-            time.perf_counter()
-            -
-            start
-        ) * 1000
+        elapsed_ms = (
+            (
+                time.perf_counter()
+                -
+                start
+            )
+            *
+            1000
+        )
 
-        return parents, ms
+        return (
+            parents,
+            elapsed_ms,
+            evidence,
+        )
+
+
+    def search(
+        self,
+        query,
+    ):
+        """Compatibility wrapper — returns (parents, elapsed_ms)."""
+
+        (
+            parents,
+            elapsed_ms,
+            _,
+        ) = self.search_with_evidence(
+            query
+        )
+
+        return parents, elapsed_ms
 
 
 # =============================================================================
@@ -446,11 +536,87 @@ def weighted_rrf(
 # CONTEXT
 # =============================================================================
 
+
+def evidence_window(
+    text: str,
+    query: str,
+    max_chars: int,
+) -> str:
+    """
+    Return the ~max_chars character region of `text` that covers the most
+    query terms. Falls back to text[:max_chars] when no terms match.
+    Does NOT alter retrieval ranking.
+    """
+
+    text = " ".join(str(text).split())
+
+    if len(text) <= max_chars:
+        return text
+
+    query_terms = [
+        term
+        for term in word_splitter(query)
+        if len(term) >= 2
+    ]
+
+    if not query_terms:
+        return text[:max_chars]
+
+    folded = text.casefold()
+
+    positions = []
+
+    for term in query_terms:
+
+        pos = folded.find(term.casefold())
+
+        if pos >= 0:
+            positions.append(pos)
+
+    if not positions:
+        return text[:max_chars]
+
+    query_set = set(query_terms)
+
+    best_window = None
+    best_score = -1
+
+    for position in positions:
+
+        start = max(
+            0,
+            position - max_chars // 3,
+        )
+
+        start = min(
+            start,
+            max(0, len(text) - max_chars),
+        )
+
+        window = text[start: start + max_chars]
+
+        window_terms = set(
+            word_splitter(window)
+        )
+
+        score = len(query_set & window_terms)
+
+        if score > best_score:
+            best_score = score
+            best_window = window
+
+    if best_window is None:
+        return text[:max_chars]
+
+    return best_window.strip()
+
+
 class ContextStore:
 
     def __init__(self):
 
         self.data = {}
+        self.chunk_lookup = {}
 
         for language, path in (
             CHUNKS.items()
@@ -474,34 +640,65 @@ class ContextStore:
                     text_col = candidate
                     break
 
+            has_chunk_id = (
+                "chunk_id" in schema
+            )
+
+            read_columns = [
+                "parent_id",
+                text_col,
+            ]
+
+            if has_chunk_id:
+                read_columns.append(
+                    "chunk_id"
+                )
+
             df = pd.read_parquet(
                 path,
-                columns=[
-                    "parent_id",
-                    text_col,
-                ],
+                columns=read_columns,
             )
 
             mapping = {}
+            chunk_mapping = {}
 
-            for parent, text in zip(
-                df["parent_id"],
-                df[text_col],
+            for row_index, row in (
+                df.iterrows()
             ):
 
-                parent = str(parent)
-                text = str(text).strip()
+                parent = str(
+                    row["parent_id"]
+                )
 
-                if text:
+                text = str(
+                    row[text_col]
+                ).strip()
 
-                    mapping.setdefault(
-                        parent,
-                        [],
-                    ).append(text)
+                if not text:
+                    continue
+
+                mapping.setdefault(
+                    parent,
+                    [],
+                ).append(text)
+
+                if has_chunk_id:
+
+                    chunk_id = str(
+                        row["chunk_id"]
+                    )
+
+                    chunk_mapping[
+                        chunk_id
+                    ] = text
 
             self.data[
                 language
             ] = mapping
+
+            self.chunk_lookup[
+                language
+            ] = chunk_mapping
 
 
     def build(
@@ -512,10 +709,15 @@ class ContextStore:
         char_budget,
         max_parents,
         per_chunk_chars,
+        evidence_by_parent=None,
     ):
 
         start = (
             time.perf_counter()
+        )
+
+        evidence_by_parent = (
+            evidence_by_parent or {}
         )
 
         query_tokens = set(
@@ -523,8 +725,8 @@ class ContextStore:
         )
 
         blocks = []
-
         used = 0
+        used_evidence = []
 
         for parent in parents:
 
@@ -535,41 +737,142 @@ class ContextStore:
             ):
                 break
 
-            candidates = (
-                self.data[
-                    language
-                ].get(
-                    str(parent),
-                    [],
-                )
+            selected_text = None
+            selected_chunk_id = None
+            selected_lane = "fallback"
+            selected_score = None
+
+            # ----------------------------------------------------------
+            # Prefer the actual child that caused retrieval.
+            # ----------------------------------------------------------
+
+            evidence = evidence_by_parent.get(
+                str(parent)
             )
 
-            if not candidates:
-                continue
+            if evidence:
 
-            best = max(
-                candidates,
+                selected_chunk_id = (
+                    evidence.get("chunk_id")
+                )
 
-                key=lambda text:
-                    len(
+                selected_lane = (
+                    evidence.get("lane", "unknown")
+                )
+
+                selected_score = (
+                    evidence.get("score")
+                )
+
+                # BM25 already carries the actual child text.
+                if evidence.get("text"):
+                    selected_text = evidence["text"]
+
+                # Dense result: resolve chunk_id -> text.
+                elif selected_chunk_id:
+                    selected_text = (
+                        self.chunk_lookup[
+                            language
+                        ].get(
+                            str(selected_chunk_id)
+                        )
+                    )
+
+            # ----------------------------------------------------------
+            # Alternate-lane fallback.
+            # If the preferred evidence text could not be resolved
+            # (dense chunk_id absent from chunk_lookup, or empty text),
+            # try the actual text from the other retrieval lane BEFORE
+            # falling all the way back to lexical parent selection.
+            # Fallback priority:
+            #   preferred retrieved child
+            #     -> alternate retrieved child
+            #       -> lexical best-child inside parent
+            # ----------------------------------------------------------
+
+            if not selected_text and evidence:
+
+                alternate = evidence.get(
+                    "alternate"
+                )
+
+                if alternate:
+
+                    alt_text = (
+                        alternate.get("text")
+                    )
+
+                    alt_chunk_id = (
+                        alternate.get("chunk_id")
+                    )
+
+                    # Dense alternate resolves via chunk_lookup.
+                    if not alt_text and alt_chunk_id:
+                        alt_text = (
+                            self.chunk_lookup[
+                                language
+                            ].get(
+                                str(alt_chunk_id)
+                            )
+                        )
+
+                    if alt_text:
+                        selected_text = alt_text
+                        selected_chunk_id = alt_chunk_id
+                        selected_lane = (
+                            alternate.get(
+                                "lane",
+                                "alternate",
+                            )
+                        )
+                        selected_score = (
+                            alternate.get("score")
+                        )
+
+            # ----------------------------------------------------------
+            # Compatibility fallback: lexical selection inside parent.
+            # ----------------------------------------------------------
+
+            if not selected_text:
+
+                candidates = (
+                    self.data[
+                        language
+                    ].get(
+                        str(parent),
+                        [],
+                    )
+                )
+
+                if not candidates:
+                    continue
+
+                selected_text = max(
+                    candidates,
+
+                    key=lambda t: len(
                         query_tokens
                         &
-                        set(
-                            word_splitter(text)
-                        )
+                        set(word_splitter(t))
                     ),
-            )
-
-            best = (
-                " ".join(
-                    best.split()
                 )
-                [:per_chunk_chars]
+
+                selected_lane = "fallback"
+
+            # ----------------------------------------------------------
+            # Select a query-centred evidence window instead of blindly
+            # truncating the beginning of the chunk.
+            # ----------------------------------------------------------
+
+            snippet = evidence_window(
+                selected_text,
+                query,
+                per_chunk_chars,
             )
 
             block = (
                 f"[{len(blocks)+1}] "
-                f"{best}"
+                f"{snippet}"
             )
 
             if (
@@ -579,7 +882,9 @@ class ContextStore:
                 >
                 char_budget
             ):
-                break
+                # Use continue (not break) so a shorter later snippet
+                # can still fill the remaining budget.
+                continue
 
             blocks.append(block)
 
@@ -587,10 +892,25 @@ class ContextStore:
                 len(block) + 2
             )
 
+            used_evidence.append({
+                "parent_id":
+                    str(parent),
+
+                "chunk_id":
+                    selected_chunk_id,
+
+                "lane":
+                    selected_lane,
+
+                "score":
+                    selected_score,
+
+                "text":
+                    snippet,
+            })
+
         context = (
-            "\n\n".join(
-                blocks
-            )
+            "\n\n".join(blocks)
         )
 
         ms = (
@@ -603,6 +923,7 @@ class ContextStore:
             context,
             ms,
             len(blocks),
+            used_evidence,
         )
 
 
@@ -823,7 +1144,7 @@ class FullRAG:
             self.executor.submit(
                 self.bm25[
                     language
-                ].search,
+                ].search_with_evidence,
                 query,
             )
         )
@@ -889,7 +1210,8 @@ class FullRAG:
                     DENSE_CHILD_K,
 
                 with_payload=[
-                    "parent_id"
+                    "parent_id",
+                    "chunk_id",
                 ],
 
                 with_vectors=
@@ -912,14 +1234,17 @@ class FullRAG:
 
         dense = []
         seen = set()
+        dense_evidence = {}
 
         for point in response.points:
 
+            payload = (
+                point.payload
+                or {}
+            )
+
             parent = str(
-                (
-                    point.payload
-                    or {}
-                ).get(
+                payload.get(
                     "parent_id",
                     "",
                 )
@@ -934,6 +1259,32 @@ class FullRAG:
 
             seen.add(parent)
             dense.append(parent)
+
+            dense_evidence[
+                parent
+            ] = {
+                "parent_id":
+                    parent,
+
+                "chunk_id":
+                    str(
+                        payload.get(
+                            "chunk_id",
+                            "",
+                        )
+                    ),
+
+                "score":
+                    float(
+                        point.score
+                    ),
+
+                "lane":
+                    "dense",
+
+                "rank":
+                    len(dense),
+            }
 
             if (
                 len(dense)
@@ -950,9 +1301,11 @@ class FullRAG:
         ) * 1000
 
 
-        sparse, bm25_ms = (
-            sparse_future.result()
-        )
+        (
+            sparse,
+            bm25_ms,
+            sparse_evidence,
+        ) = sparse_future.result()
 
 
         fused = weighted_rrf(
@@ -960,6 +1313,92 @@ class FullRAG:
             sparse,
             language,
         )
+
+
+        # -----------------------------------------------------------------
+        # EVIDENCE SELECTION
+        #
+        # For each parent in the already-ranked fused list, pick the child
+        # (dense or BM25) whose RRF contribution was larger. This does not
+        # affect the fused ranking — it only determines which actual child
+        # text is forwarded to ContextStore.
+        # -----------------------------------------------------------------
+
+        cfg = CFG[language]
+
+        dense_rank = {
+            parent: rank
+            for rank, parent
+            in enumerate(dense, start=1)
+        }
+
+        sparse_rank = {
+            parent: rank
+            for rank, parent
+            in enumerate(sparse, start=1)
+        }
+
+        def _rrf_contribution(rank, weight):
+            if rank is None:
+                return 0.0
+            return (
+                1.0
+                /
+                (
+                    cfg["rrf_k"]
+                    +
+                    rank / weight
+                    -
+                    1
+                )
+            )
+
+        evidence_by_parent = {}
+
+        for parent in fused:
+
+            dense_info = (
+                dense_evidence.get(parent)
+            )
+
+            sparse_info = (
+                sparse_evidence.get(parent)
+            )
+
+            dense_contrib = _rrf_contribution(
+                dense_rank.get(parent),
+                cfg["dense_weight"],
+            )
+
+            sparse_contrib = _rrf_contribution(
+                sparse_rank.get(parent),
+                cfg["sparse_weight"],
+            )
+
+            if (
+                dense_info
+                and
+                dense_contrib >= sparse_contrib
+            ):
+                # Dense wins — keep sparse as alternate in case
+                # chunk_lookup can't resolve the dense chunk_id.
+                selected = dict(dense_info)
+                if sparse_info:
+                    selected["alternate"] = sparse_info
+                evidence_by_parent[parent] = selected
+
+            elif sparse_info:
+                # Sparse wins — keep dense as alternate.
+                selected = dict(sparse_info)
+                if dense_info:
+                    selected["alternate"] = dense_info
+                evidence_by_parent[parent] = selected
+
+            elif dense_info:
+                # Dense only, no sparse match.
+                evidence_by_parent[parent] = dict(
+                    dense_info
+                )
 
 
         retrieval_ms = (
@@ -972,6 +1411,17 @@ class FullRAG:
         return {
             "parents":
                 fused,
+
+            # Exposed for the retrieval parity gate (dense + sparse + fused).
+            # Ignored by all production callers which read ["parents"] only.
+            "dense_parents":
+                dense,
+
+            "sparse_parents":
+                sparse,
+
+            "evidence_by_parent":
+                evidence_by_parent,
 
             "embed_ms":
                 embed_ms,
@@ -1178,6 +1628,23 @@ class FullRAG:
                 +
                 complete_ms,
 
+            # Absolute timestamps for clean complete-latency calculation.
+            # Callers compute full_rag_complete_ms as:
+            #   (completed_at - overall_start) * 1000
             "first_token_at":
                 streamer.first_token_at,
+
+            "completed_at":
+                streamer.completed_at,
+
+            # Telemetry for truncation-rate benchmark.
+            # Correction 3: token-limit hit only — no EOS ID dependency.
+            "generated_tokens":
+                len(streamer.generated_ids),
+
+            "possibly_truncated": (
+                len(streamer.generated_ids)
+                >=
+                max_new_tokens
+            ),
         }

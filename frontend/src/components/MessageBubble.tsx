@@ -1,11 +1,12 @@
-import type { GuardrailInfo, StageLatencies } from "../lib/api";
+import { useState } from "react";
+import type { GuardrailInfo, SourceEvidence, StageLatencies } from "../lib/api";
 import { LatencyPanel } from "./LatencyPanel";
 
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "system";
   text: string;
-  sources?: string[];
+  sources?: SourceEvidence[];
   stageLatencies?: StageLatencies;
   guardrail?: GuardrailInfo;
   retried?: boolean;
@@ -20,6 +21,61 @@ const GUARDRAIL_LABEL: Record<string, string> = {
   no_grounded_context: "Not found in knowledge base",
   ungrounded_answer: "Not found in knowledge base",
 };
+
+const LANE_COLORS: Record<string, string> = {
+  dense: "text-sky-400",
+  bm25: "text-emerald-400",
+  fallback: "text-slate-500",
+};
+
+function EvidenceCard({
+  evidence,
+  index,
+}: {
+  evidence: SourceEvidence;
+  index: number;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const lane = (evidence.lane ?? "unknown").toUpperCase();
+  const laneColor =
+    LANE_COLORS[(evidence.lane ?? "").toLowerCase()] ?? "text-slate-400";
+
+  return (
+    <div className="mt-2 rounded-lg border border-goat-border bg-black/20 p-3 text-xs">
+      {/* Header */}
+      <div className={`mb-1.5 flex items-center gap-2 font-semibold uppercase tracking-widest ${laneColor}`}>
+        <span className="text-slate-500">SOURCE {index + 1}</span>
+        <span className="text-slate-600">·</span>
+        <span>{lane}</span>
+      </div>
+
+      {/* Evidence snippet */}
+      <blockquote className="border-l-2 border-goat-accent/40 pl-2.5 text-slate-300 leading-relaxed">
+        "{evidence.text}"
+      </blockquote>
+
+      {/* Expandable parent ID */}
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        className="mt-1.5 text-[10px] text-slate-600 hover:text-slate-400 transition-colors"
+      >
+        {expanded ? "▲ hide" : "▼ details"}
+      </button>
+
+      {expanded && (
+        <div className="mt-1.5 space-y-0.5 text-[10px] text-slate-500 font-mono">
+          <div>Parent: {evidence.parent_id}</div>
+          {evidence.chunk_id && (
+            <div>Chunk: {evidence.chunk_id}</div>
+          )}
+          {typeof evidence.score === "number" && (
+            <div>Score: {evidence.score.toFixed(4)}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function MessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
@@ -54,14 +110,12 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
             <p className="whitespace-pre-wrap leading-relaxed">{message.text}</p>
 
             {message.sources && message.sources.length > 0 && (
-              <div className="mt-2 flex flex-wrap gap-1">
-                {message.sources.map((source) => (
-                  <span
-                    key={source}
-                    className="rounded-full bg-black/30 px-2 py-0.5 text-[11px] text-slate-400"
-                  >
-                    #{source}
-                  </span>
+              <div className="mt-3">
+                <div className="text-[10px] font-semibold uppercase tracking-widest text-slate-500 mb-1">
+                  Grounded Evidence
+                </div>
+                {message.sources.map((src, i) => (
+                  <EvidenceCard key={src.parent_id + i} evidence={src} index={i} />
                 ))}
               </div>
             )}

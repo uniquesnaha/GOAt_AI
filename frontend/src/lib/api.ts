@@ -9,7 +9,9 @@ export interface StageLatencies {
   prompt_prep_ms?: number | null;
   model_first_token_ms?: number | null;
   generation_ttft_ms?: number | null;
+  generation_complete_ms?: number | null;
   full_rag_ttft_ms?: number | null;
+  full_rag_complete_ms?: number | null;
   request_overhead_ms?: number | null;
 }
 
@@ -20,10 +22,18 @@ export interface GuardrailInfo {
   reason?: string | null;
 }
 
+export interface SourceEvidence {
+  parent_id: string;
+  chunk_id?: string | null;
+  lane?: string | null;
+  score?: number | null;
+  text: string;
+}
+
 export interface QueryResponse {
   answer: string;
   language: Language;
-  sources: string[];
+  sources: SourceEvidence[];
   stage_latencies: StageLatencies;
   guardrail: GuardrailInfo;
   retried: boolean;

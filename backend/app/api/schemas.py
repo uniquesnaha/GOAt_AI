@@ -22,7 +22,9 @@ class StageLatencies(BaseModel):
     prompt_prep_ms: Optional[float] = None
     model_first_token_ms: Optional[float] = None
     generation_ttft_ms: Optional[float] = None
+    generation_complete_ms: Optional[float] = None
     full_rag_ttft_ms: Optional[float] = None
+    full_rag_complete_ms: Optional[float] = None
     request_overhead_ms: Optional[float] = None
 
 
@@ -33,10 +35,18 @@ class GuardrailInfo(BaseModel):
     reason: Optional[str] = None
 
 
+class SourceEvidence(BaseModel):
+    parent_id: str
+    chunk_id: Optional[str] = None
+    lane: Optional[str] = None
+    score: Optional[float] = None
+    text: str
+
+
 class QueryResponse(BaseModel):
     answer: str
     language: Language
-    sources: list[str] = Field(default_factory=list)
+    sources: list[SourceEvidence] = Field(default_factory=list)
     stage_latencies: StageLatencies
     guardrail: GuardrailInfo
     retried: bool = False
