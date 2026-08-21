@@ -124,6 +124,18 @@ _MCQ_PREFIX_RE = re.compile(
     r"^[A-Da-d][.)]\s*",
 )
 
+# Sentence boundary: danda, double danda, or `. `/`! `/`? ` followed by a
+# non-digit (avoids splitting "100.5 kg" or "3.14 m/s").
+_SENTENCE_BREAK_RE = re.compile(
+    r"[\u0964\u0965।॥]|[.!?](?=\s+\D)",
+)
+
+# Indic combining/vowel-sign characters that can ONLY appear mid-word,
+# never as the first character of an independent answer.
+_INDIC_VOWEL_SIGN_RE = re.compile(
+    r"^[\u0BBE-\u0BCD\u093E-\u094D]",
+)
+
 
 def _clean_answer(answer: str) -> str:
     cleaned = str(answer).strip()
@@ -133,7 +145,17 @@ def _clean_answer(answer: str) -> str:
     # when evidence contains numbered lists that look like answer choices.
     cleaned = _MCQ_PREFIX_RE.sub("", cleaned)
     cleaned = " ".join(cleaned.split())
-    return cleaned.strip(" -–—:;,.|")
+    cleaned = cleaned.strip(" -–—:;,.|")
+
+    # Trim to the first complete sentence.
+    # The 0.6B model sometimes copies an evidence sentence rather than
+    # answering concisely: e.g. "தலைநகரம் புதுதில்லி. மக்கள்தொகை 1,703,900".
+    # Keeping only the first sentence removes the trailing noise.
+    match = _SENTENCE_BREAK_RE.search(cleaned)
+    if match and match.start() > 0:
+        cleaned = cleaned[: match.start() + 1].strip(" -–—:;,.|")
+
+    return cleaned
 
 
 
@@ -228,6 +250,17 @@ def apply_output_guardrail(
         )
 
     cleaned = _clean_answer(stripped)
+
+    # An answer starting with an Indic vowel sign (e.g. ா, ி, ा, ि) cannot
+    # be an independent word — it is the continuation of a word that started
+    # in the evidence. The model echoed a mid-sentence fragment instead of
+    # answering. Reject so the UI shows NOT_FOUND rather than garbled text.
+    if _INDIC_VOWEL_SIGN_RE.match(cleaned):
+        return _localized_rejection(
+            language,
+            "evidence_echo",
+            "Answer starts mid-word (model echoed evidence sentence).",
+        )
 
     # Only reject on actual Unicode corruption (U+FFFD replacement character).
     # The possibly_truncated flag (generated_tokens == MAX_NEW_TOKENS) is NOT
