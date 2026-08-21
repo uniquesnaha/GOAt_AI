@@ -594,7 +594,7 @@ def evidence_window(
 ) -> str:
     """
     Return the ~max_chars character region of `text` that covers the most
-    query terms. Falls back to text[:max_chars] when no terms match.
+    query terms, snapped to complete word boundaries.
     Does NOT alter retrieval ranking.
     """
 
@@ -609,22 +609,37 @@ def evidence_window(
         if len(term) >= 2
     ]
 
+    def _snap_to_words(raw_start: int, raw_end: int) -> str:
+        # Snap start forward to word boundary if slicing mid-word
+        if raw_start > 0:
+            space_after = text.find(" ", raw_start)
+            start = (space_after + 1) if (space_after != -1 and space_after < raw_end) else raw_start
+        else:
+            start = 0
+
+        # Snap end backward to word boundary if slicing mid-word
+        if raw_end < len(text):
+            space_before = text.rfind(" ", start, raw_end)
+            end = space_before if (space_before > start) else raw_end
+        else:
+            end = len(text)
+
+        return text[start:end].strip()
+
     if not query_terms:
-        return text[:max_chars]
+        return _snap_to_words(0, max_chars)
 
     folded = text.casefold()
 
     positions = []
 
     for term in query_terms:
-
         pos = folded.find(term.casefold())
-
         if pos >= 0:
             positions.append(pos)
 
     if not positions:
-        return text[:max_chars]
+        return _snap_to_words(0, max_chars)
 
     query_set = set(query_terms)
 
@@ -632,18 +647,17 @@ def evidence_window(
     best_score = -1
 
     for position in positions:
-
-        start = max(
+        raw_start = max(
             0,
             position - max_chars // 3,
         )
 
-        start = min(
-            start,
-            max(0, len(text) - max_chars),
+        raw_end = min(
+            len(text),
+            raw_start + max_chars,
         )
 
-        window = text[start: start + max_chars]
+        window = _snap_to_words(raw_start, raw_end)
 
         window_terms = set(
             word_splitter(window)
@@ -655,10 +669,11 @@ def evidence_window(
             best_score = score
             best_window = window
 
-    if best_window is None:
-        return text[:max_chars]
+    if not best_window:
+        return _snap_to_words(0, max_chars)
 
     return best_window.strip()
+
 
 
 class ContextStore:
