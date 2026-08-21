@@ -132,19 +132,27 @@ def _clean_answer(answer: str) -> str:
     # Strip MCQ option prefixes (A. B. C. D.) — the 0.6B model generates these
     # when evidence contains numbered lists that look like answer choices.
     cleaned = _MCQ_PREFIX_RE.sub("", cleaned)
+    # Sanitize Unicode replacement character instead of rejecting the whole answer
+    cleaned = cleaned.replace("\ufffd", "")
     cleaned = " ".join(cleaned.split())
     return cleaned.strip(" -–—:;,.|")
 
 
 
 def _supported_by_context(answer: str, context: str) -> bool:
-    """Require at least one meaningful answer term to occur in evidence."""
+    """Require at least one meaningful answer term or number to occur in evidence."""
 
     answer_terms = [
         term
         for term in _terms(answer)
         if len(term) >= 2
     ]
+
+    # Numeric grounding: if answer contains digits that appear in context, it is grounded
+    answer_digits = set(re.findall(r"\d+", answer))
+    context_digits = set(re.findall(r"\d+", context))
+    if answer_digits and (answer_digits & context_digits):
+        return True
 
     if not answer_terms:
         return bool(
@@ -162,7 +170,7 @@ def _supported_by_context(answer: str, context: str) -> bool:
             min(
                 len(answer_term),
                 len(context_term),
-            ) >= 4
+            ) >= 3
             and (
                 answer_term in context_term
                 or context_term in answer_term
@@ -229,18 +237,12 @@ def apply_output_guardrail(
 
     cleaned = _clean_answer(stripped)
 
-    # Only reject on actual Unicode corruption (U+FFFD replacement character).
-    # The possibly_truncated flag (generated_tokens == MAX_NEW_TOKENS) is NOT
-    # a reliable signal: Hindi words ending in consonants (एवरेस्ट, महासागर)
-    # and Tamil words ending in vowel signs (புதுதில்லி) are complete answers
-    # that legitimately use all tokens. Token count alone must not reject them.
-    if "\ufffd" in cleaned:
+    if not cleaned:
         return _localized_rejection(
             language,
-            "truncated_answer",
-            "Model output contained a Unicode corruption marker.",
+            "empty_answer",
+            "Model returned an empty answer after cleaning.",
         )
-
 
     answer_terms = _terms(cleaned)
     for left, middle, right in zip(
@@ -264,15 +266,14 @@ def apply_output_guardrail(
         )
 
     target_script = _TARGET_SCRIPT.get(language)
-    if (
-        target_script is not None
-        and not target_script.search(cleaned)
-        and not _NUMERIC_ANSWER_RE.fullmatch(cleaned)
-    ):
+    # Permissive script check: allow target script, Latin alphabet (for entities/units), or numeric answers
+    has_target_script = bool(target_script and target_script.search(cleaned))
+    has_latin_or_numbers = bool(re.search(r"[a-zA-Z0-9]", cleaned))
+    if not (has_target_script or has_latin_or_numbers or _NUMERIC_ANSWER_RE.fullmatch(cleaned)):
         return _localized_rejection(
             language,
             "wrong_language",
-            "Model answered in the wrong script.",
+            "Model answered in an unsupported script.",
         )
 
     if context and not _supported_by_context(
