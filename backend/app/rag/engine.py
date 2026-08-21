@@ -1198,8 +1198,9 @@ class FullRAG:
             )
         )
 
-        # The question is deliberately placed before evidence in generate().
-        # Right-side truncation therefore drops only excess evidence, never Q.
+        # generate() budgets evidence so the final prompt fits. Right-side
+        # truncation remains an additional safety net for unexpected template
+        # overhead; the explicit budget normally prevents it from activating.
         self.gen_tokenizer.truncation_side = (
             "right"
         )
@@ -1588,39 +1589,70 @@ class FullRAG:
             time.perf_counter()
         )
 
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Use only E. "
-                    "Reply with only the shortest complete answer "
-                    "in the language of Q. "
-                    "Do not cite, explain, or repeat Q. "
-                    "If E lacks the answer, reply NOT_FOUND."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Q:\n{query}\n"
-                    f"E:\n{context}"
-                ),
-            },
-        ]
-
-
-        prompt = (
-            self.gen_tokenizer
-            .apply_chat_template(
-                messages,
-
-                tokenize=False,
-
-                add_generation_prompt=True,
-
-                enable_thinking=False,
-            )
+        system_message = (
+            "Extract the shortest answer span from E that answers Q. "
+            "Return only that span in Q's language. "
+            "If E has no answer span, return NOT_FOUND."
         )
+
+        def render_prompt(evidence):
+            messages = [
+                {
+                    "role": "system",
+                    "content": system_message,
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"E:\n{evidence}\n"
+                        f"Q:\n{query}\n"
+                        "A:"
+                    ),
+                },
+            ]
+
+            return (
+                self.gen_tokenizer
+                .apply_chat_template(
+                    messages,
+
+                    tokenize=False,
+
+                    add_generation_prompt=True,
+
+                    enable_thinking=False,
+                )
+            )
+
+        # Preserve the proven E -> Q causal order without allowing the
+        # 512-token ceiling to remove Q. Budget evidence tokens explicitly,
+        # leaving a small margin for chat-template boundary tokens.
+        prompt_without_evidence = render_prompt("")
+
+        base_token_count = len(
+            self.gen_tokenizer(
+                prompt_without_evidence,
+                add_special_tokens=False,
+            )["input_ids"]
+        )
+
+        evidence_token_budget = max(
+            0,
+            512 - base_token_count - 8,
+        )
+
+        evidence_ids = self.gen_tokenizer(
+            context,
+            add_special_tokens=False,
+        )["input_ids"]
+
+        if len(evidence_ids) > evidence_token_budget:
+            context = self.gen_tokenizer.decode(
+                evidence_ids[:evidence_token_budget],
+                skip_special_tokens=True,
+            )
+
+        prompt = render_prompt(context)
 
 
         inputs = (
