@@ -26,6 +26,7 @@ import pandas as pd
 import torch
 
 from app.config import settings
+from app.guardrails import guardrails
 from app.rag.engine import FullRAG
 
 
@@ -620,6 +621,24 @@ def main():
             0,
         )
 
+        answer, output_check = (
+            guardrails.apply_output_guardrail(
+                generation["answer"],
+                row["language"],
+                query=row["query"],
+                context=context,
+                possibly_truncated=possibly_truncated,
+            )
+        )
+
+        # The deployed API treats every rejected generation as an abstention.
+        # Keep the original sentinel check for compatibility, but include all
+        # deterministic output-guardrail rejections in benchmark reporting.
+        is_not_found = (
+            is_not_found
+            or not output_check.allowed
+        )
+
 
         results.append({
             "language":
@@ -715,9 +734,13 @@ def main():
                 full_complete,
 
             "answer":
-                generation[
-                    "answer"
-                ],
+                answer,
+
+            "raw_answer":
+                generation["answer"],
+
+            "output_guardrail_code":
+                output_check.code,
         })
 
 

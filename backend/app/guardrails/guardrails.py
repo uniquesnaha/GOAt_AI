@@ -13,6 +13,7 @@ says NOT_FOUND -> say so gracefully.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Optional
 
@@ -20,6 +21,20 @@ SUPPORTED_LANGUAGES = {"ta", "hi"}
 
 MAX_QUERY_CHARS = 500
 NOT_FOUND_SENTINEL = "NOT_FOUND"
+
+_CITATION_RE = re.compile(r"\[\s*\d+\s*\]")
+_CITATION_ONLY_RE = re.compile(
+    r"^(?:\s*\[\s*\d+\s*\]\s*)+$"
+)
+_TARGET_SCRIPT = {
+    "ta": re.compile(r"[\u0B80-\u0BFF]"),
+    "hi": re.compile(r"[\u0900-\u097F]"),
+}
+_NUMERIC_ANSWER_RE = re.compile(
+    r"^[\s\d.,:+\-−°%/]+"
+    r"(?:c|f|°c|°f|km|kg|m|cm|mm)?$",
+    re.IGNORECASE,
+)
 
 # Minimal, non-exhaustive safety net for clearly unsafe requests (self-harm
 # instructions, weapon/explosive construction, csam). This is intentionally
@@ -87,20 +102,175 @@ def check_grounding(parents: list, context: str) -> GuardrailResult:
     return GuardrailResult(True, stage)
 
 
-def apply_output_guardrail(answer: str, language: str) -> tuple[str, GuardrailResult]:
-    """Rewrites the model's NOT_FOUND sentinel into a graceful message.
+def _terms(text: str) -> list[str]:
+    terms = []
+    current = []
 
-    Does not alter *how* the model decided to say NOT_FOUND (that's the
-    untouched system prompt in engine.py) — only how it's surfaced.
+    for char in str(text).casefold():
+        category = unicodedata.category(char)
+        if category and category[0] in {"L", "M", "N"}:
+            current.append(char)
+        elif current:
+            terms.append("".join(current))
+            current = []
+
+    if current:
+        terms.append("".join(current))
+
+    return terms
+
+
+def _clean_answer(answer: str) -> str:
+    cleaned = str(answer).strip()
+    cleaned = cleaned.replace("**", "")
+    cleaned = _CITATION_RE.sub("", cleaned)
+    cleaned = " ".join(cleaned.split())
+    return cleaned.strip(" -–—:;,.|")
+
+
+def _supported_by_context(answer: str, context: str) -> bool:
+    """Require at least one meaningful answer term to occur in evidence."""
+
+    answer_terms = [
+        term
+        for term in _terms(answer)
+        if len(term) >= 2
+    ]
+
+    if not answer_terms:
+        return bool(
+            re.search(r"\d", answer)
+            and re.search(r"\d", context)
+        )
+
+    context_terms = set(
+        _terms(context)
+    )
+
+    return any(
+        answer_term == context_term
+        or (
+            min(
+                len(answer_term),
+                len(context_term),
+            ) >= 4
+            and (
+                answer_term in context_term
+                or context_term in answer_term
+            )
+        )
+        for answer_term in answer_terms
+        for context_term in context_terms
+    )
+
+
+def _localized_rejection(
+    language: str,
+    code: str,
+    reason: str,
+) -> tuple[str, GuardrailResult]:
+    message = NOT_FOUND_MESSAGE.get(
+        language,
+        DEFAULT_NOT_FOUND_MESSAGE,
+    )
+    return message, GuardrailResult(
+        False,
+        "output",
+        code,
+        reason,
+    )
+
+
+def apply_output_guardrail(
+    answer: str,
+    language: str,
+    *,
+    query: str = "",
+    context: str = "",
+    possibly_truncated: bool = False,
+) -> tuple[str, GuardrailResult]:
+    """Clean harmless formatting and reject malformed/ungrounded output.
+
+    This is deterministic and adds no model call, preserving first-token
+    latency. Rejected output is surfaced as the localized NOT_FOUND message.
     """
     stage = "output"
 
     stripped = answer.strip()
     if stripped == NOT_FOUND_SENTINEL or stripped.startswith(NOT_FOUND_SENTINEL):
-        message = NOT_FOUND_MESSAGE.get(language, DEFAULT_NOT_FOUND_MESSAGE)
-        return message, GuardrailResult(False, stage, "ungrounded_answer", "Model reported NOT_FOUND.")
+        return _localized_rejection(
+            language,
+            "ungrounded_answer",
+            "Model reported NOT_FOUND.",
+        )
 
-    return answer, GuardrailResult(True, stage)
+    if not stripped:
+        return _localized_rejection(
+            language,
+            "empty_answer",
+            "Model returned an empty answer.",
+        )
+
+    if _CITATION_ONLY_RE.fullmatch(stripped):
+        return _localized_rejection(
+            language,
+            "citation_only",
+            "Model returned a citation without an answer.",
+        )
+
+    cleaned = _clean_answer(stripped)
+
+    if possibly_truncated or "�" in cleaned:
+        return _localized_rejection(
+            language,
+            "truncated_answer",
+            "Model output reached its token limit or ended mid-token.",
+        )
+
+    answer_terms = _terms(cleaned)
+    for left, middle, right in zip(
+        answer_terms,
+        answer_terms[1:],
+        answer_terms[2:],
+    ):
+        if left == middle == right:
+            return _localized_rejection(
+                language,
+                "repeated_answer",
+                "Model output contains excessive repetition.",
+            )
+
+    query_terms = set(_terms(query))
+    if answer_terms and set(answer_terms).issubset(query_terms):
+        return _localized_rejection(
+            language,
+            "question_echo",
+            "Model repeated the question instead of answering it.",
+        )
+
+    target_script = _TARGET_SCRIPT.get(language)
+    if (
+        target_script is not None
+        and not target_script.search(cleaned)
+        and not _NUMERIC_ANSWER_RE.fullmatch(cleaned)
+    ):
+        return _localized_rejection(
+            language,
+            "wrong_language",
+            "Model answered in the wrong script.",
+        )
+
+    if context and not _supported_by_context(
+        cleaned,
+        context,
+    ):
+        return _localized_rejection(
+            language,
+            "unsupported_answer",
+            "Generated answer text is not supported by the packed evidence.",
+        )
+
+    return cleaned, GuardrailResult(True, stage)
 
 
 def not_found_response_text(language: str) -> str:

@@ -434,6 +434,18 @@ def query(
             ],
 
             payload.language,
+
+            query=
+                payload.query,
+
+            context=
+                context,
+
+            possibly_truncated=
+                generation.get(
+                    "possibly_truncated",
+                    False,
+                ),
         )
     )
 

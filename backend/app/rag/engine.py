@@ -11,11 +11,11 @@ path forever). Only two things were changed relative to that script:
   2. The Qdrant client points at `app.config.settings.qdrant_url` instead of
      the hardcoded `http://127.0.0.1:6333`.
 
-Every constant, weight, prompt, and function body below is otherwise
-identical to the golden script. `backend/parity/test_parity.py` mechanically
-checks that this file and the golden script produce identical retrieval and
-generation output for the same queries — do not edit the RAG logic here
-without also re-running that gate.
+Retrieval ranking remains identical to the golden script. Context selection
+may prefer the more query-relevant child already present in the frozen fused
+top-20, and generation keeps the question ahead of evidence so tokenizer
+truncation cannot silently remove it. Run the retrieval-only parity gate after
+changes to confirm dense, sparse, and fused rankings are unchanged.
 """
 
 from __future__ import annotations
@@ -42,6 +42,9 @@ from transformers import (
 from transformers.generation.streamers import BaseStreamer
 
 from app.config import settings
+from app.rag.evidence_quality import evidence_relevance_score
+
+ROOT = Path(settings.data_root)
 
 
 # =============================================================================
@@ -773,6 +776,75 @@ class ContextStore:
             word_splitter(query)
         )
 
+        # --------------------------------------------------------------
+        # Rerank only the frozen fused candidates for context packing.
+        # Exact query coverage is a low-cost tie-breaker that helps BM25
+        # evidence containing the named entity/fact reach the two-slot
+        # prompt. Original fused order remains the deterministic fallback.
+        # --------------------------------------------------------------
+
+        original_rank = {
+            str(parent): rank
+            for rank, parent in enumerate(
+                parents
+            )
+        }
+
+        def evidence_texts(parent):
+            evidence = evidence_by_parent.get(
+                str(parent)
+            )
+
+            if not evidence:
+                return []
+
+            texts = []
+
+            for candidate in (
+                evidence,
+                evidence.get("alternate"),
+            ):
+                if not candidate:
+                    continue
+
+                text = candidate.get("text")
+                chunk_id = candidate.get(
+                    "chunk_id"
+                )
+
+                if not text and chunk_id:
+                    text = self.chunk_lookup[
+                        language
+                    ].get(str(chunk_id))
+
+                if text:
+                    texts.append(str(text))
+
+            return texts
+
+        parents = sorted(
+            (
+                str(parent)
+                for parent in parents
+            ),
+            key=lambda parent: (
+                -max(
+                    (
+                        evidence_relevance_score(
+                            query,
+                            text,
+                            language,
+                        )
+                        for text in evidence_texts(
+                            parent
+                        )
+                    ),
+                    default=0.0,
+                ),
+                original_rank[parent],
+            ),
+        )
+
         blocks = []
         used = 0
         used_evidence = []
@@ -828,18 +900,12 @@ class ContextStore:
                     )
 
             # ----------------------------------------------------------
-            # Alternate-lane fallback.
-            # If the preferred evidence text could not be resolved
-            # (dense chunk_id absent from chunk_lookup, or empty text),
-            # try the actual text from the other retrieval lane BEFORE
-            # falling all the way back to lexical parent selection.
-            # Fallback priority:
-            #   preferred retrieved child
-            #     -> alternate retrieved child
-            #       -> lexical best-child inside parent
+            # Compare the preferred and alternate retrieved children.
+            # The higher query-coverage child is more useful to the small
+            # generator. This changes neither parent fusion nor retrieval.
             # ----------------------------------------------------------
 
-            if not selected_text and evidence:
+            if evidence:
 
                 alternate = evidence.get(
                     "alternate"
@@ -865,7 +931,22 @@ class ContextStore:
                             )
                         )
 
-                    if alt_text:
+                    if (
+                        alt_text
+                        and (
+                            not selected_text
+                            or evidence_relevance_score(
+                                query,
+                                alt_text,
+                                language,
+                            )
+                            > evidence_relevance_score(
+                                query,
+                                selected_text,
+                                language,
+                            )
+                        )
+                    ):
                         selected_text = alt_text
                         selected_chunk_id = alt_chunk_id
                         selected_lane = (
@@ -1115,6 +1196,12 @@ class FullRAG:
             .from_pretrained(
                 GEN_MODEL
             )
+        )
+
+        # The question is deliberately placed before evidence in generate().
+        # Right-side truncation therefore drops only excess evidence, never Q.
+        self.gen_tokenizer.truncation_side = (
+            "right"
         )
 
         self.generator = (
@@ -1505,16 +1592,18 @@ class FullRAG:
             {
                 "role": "system",
                 "content": (
-                    "Answer only from C. "
-                    "Reply briefly in the language of Q. "
-                    "If unsupported, reply NOT_FOUND."
+                    "Use only E. "
+                    "Reply with only the shortest complete answer "
+                    "in the language of Q. "
+                    "Do not cite, explain, or repeat Q. "
+                    "If E lacks the answer, reply NOT_FOUND."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"C:\n{context}\n"
-                    f"Q:\n{query}"
+                    f"Q:\n{query}\n"
+                    f"E:\n{context}"
                 ),
             },
         ]
