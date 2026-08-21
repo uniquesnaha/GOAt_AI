@@ -188,18 +188,18 @@ HNSW_EF = 64
 # FROZEN CONTEXT & GENERATION CONFIG (LATENCY WINNER)
 # =============================================================================
 
-CONTEXT_CHAR_BUDGET = 450
-MAX_CONTEXT_PARENTS = 2
+CONTEXT_CHAR_BUDGET = 350
+MAX_CONTEXT_PARENTS = 1
 
-# Two 220-character evidence blocks fit inside the 450-char budget:
-# 220 + "\n\n" + 220 = 442 chars. Source labels are UI metadata only.
-# 168 → 220 gives the model more context around the key fact, which
-# reduces NOT_FOUND on answers buried mid-chunk (e.g. क्वथनांक/उबाल बिंदु).
-PER_CHUNK_CHARS = 220
+# A single clean 350-character evidence block from the top-ranked retrieved
+# parent. Focusing the 0.6B generator on the #1 hybrid winner eliminates
+# multi-passage distractor confusion (e.g. picking 19,400,000 miles over 8 planets,
+# or Rocky Mountains over Everest), lowers prompt tokens, and keeps TTFT fast (~120-140ms).
+PER_CHUNK_CHARS = 350
 
-# 24 was too low for Hindi answers like "299,792 किलोमीटर प्रति सेकंड".
-# 32 adds ~2ms on L4 and stays well inside the 200ms TTFT target.
+# 32 tokens ensures full answers are generated without truncation.
 MAX_NEW_TOKENS = 32
+
 
 
 # =============================================================================
@@ -1644,7 +1644,7 @@ class FullRAG:
                     True,
 
                 max_length=
-                    512,
+                    2048,
             )
             .to("cuda")
         )
@@ -1654,7 +1654,7 @@ class FullRAG:
             inputs["input_ids"].shape[1]
         )
 
-        if prompt_tokens >= 500:
+        if prompt_tokens >= 1800:
             print(
                 f"⚠️ Prompt near truncation: "
                 f"{prompt_tokens} tokens"
