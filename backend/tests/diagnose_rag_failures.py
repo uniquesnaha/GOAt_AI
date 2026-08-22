@@ -300,6 +300,35 @@ def run_diagnostics(output_csv: str | None = None) -> list[dict]:
         pct = (count / total * 100) if total else 0
         print(f"  {cat:<25}: {count:>3}/{total} ({pct:>5.1f}%)")
 
+    import numpy as np
+
+    total_ttfts = [r["total_ttft_ms"] for r in results if r["total_ttft_ms"] is not None]
+    retrieval_lats = [r["retrieval_ms"] for r in results if r["retrieval_ms"] is not None]
+    model_lats = [r["model_ttft_ms"] for r in results if r["model_ttft_ms"] is not None]
+
+    print("\n" + "-" * 50)
+    print("LATENCY PERCENTILES (ms)")
+    print("-" * 50)
+    if total_ttfts:
+        print(
+            f"  End-to-End TTFT  : P50={np.percentile(total_ttfts, 50):.1f}ms | "
+            f"P95={np.percentile(total_ttfts, 95):.1f}ms | "
+            f"P99={np.percentile(total_ttfts, 99):.1f}ms"
+        )
+    if retrieval_lats:
+        print(
+            f"  Retrieval        : P50={np.percentile(retrieval_lats, 50):.1f}ms | "
+            f"P95={np.percentile(retrieval_lats, 95):.1f}ms | "
+            f"P99={np.percentile(retrieval_lats, 99):.1f}ms"
+        )
+    if model_lats:
+        print(
+            f"  Model TTFT (mT0) : P50={np.percentile(model_lats, 50):.1f}ms | "
+            f"P95={np.percentile(model_lats, 95):.1f}ms | "
+            f"P99={np.percentile(model_lats, 99):.1f}ms"
+        )
+    print("-" * 50)
+
     if output_csv:
         csv_path = Path(output_csv)
         csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -310,6 +339,7 @@ def run_diagnostics(output_csv: str | None = None) -> list[dict]:
         print(f"\nDetailed CSV exported to: {csv_path.resolve()}")
 
     return results
+
 
 
 if __name__ == "__main__":

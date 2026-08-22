@@ -18,6 +18,7 @@ No retrieval-weight changes.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 import unicodedata
@@ -135,7 +136,7 @@ QUERY_MAX_LENGTH = 256
 
 
 # =============================================================================
-# FROZEN RETRIEVAL CONFIG
+# RETRIEVAL V3
 # =============================================================================
 
 CFG = {
@@ -184,13 +185,43 @@ CFG = {
 DENSE_CHILD_K = 100
 DENSE_PARENT_K = 50
 
-BM25_CHUNK_K = 500
+BM25_CHUNK_K = 350
 SPARSE_PARENT_K = 50
 
+# Candidate generation.
 FUSION_DEPTH = 50
+FUSION_CANDIDATE_K = 30
+
+# Lightweight deterministic rerank.
+RERANK_PARENT_K = 30
+
+# Returned retrieval parents.
 FINAL_PARENT_K = 20
 
+
+# Keep HNSW unchanged initially.
 HNSW_EF = 64
+
+# Standard-ish RRF smoothing.
+RRF_K_V3 = 20.0
+
+# Query-view weights.
+DENSE_FULL_WEIGHT = 1.00
+DENSE_ANCHOR_WEIGHT = 0.70
+SPARSE_FULL_WEIGHT = 1.00
+SPARSE_ANCHOR_WEIGHT = 1.15
+
+# Deterministic parent-rerank weights.
+RR_WEIGHT = 0.28
+ANCHOR_WEIGHT = 0.27
+QUERY_COVERAGE_WEIGHT = 0.20
+EVIDENCE_WEIGHT = 0.15
+LANE_AGREEMENT_WEIGHT = 0.05
+PHRASE_WEIGHT = 0.05
+ANCHOR_MISS_PENALTY = 0.18
+
+MAX_ANCHOR_TERMS = 3
+
 
 
 # =============================================================================
@@ -261,8 +292,86 @@ def word_splitter(text):
     return tokens
 
 
+QUESTION_TERMS = {
+    "ta": {
+        "எது",
+        "என்ன",
+        "யார்",
+        "எங்கு",
+        "எங்கே",
+        "எந்த",
+        "எத்தனை",
+        "எவ்வளவு",
+        "எப்போது",
+        "எப்படி",
+        "ஏன்",
+        "ஒரு",
+        "என்று",
+    },
+
+    "hi": {
+        "क्या",
+        "कौन",
+        "कहाँ",
+        "कहां",
+        "किस",
+        "कितने",
+        "कितना",
+        "कितनी",
+        "कब",
+        "कैसे",
+        "क्यों",
+        "एक",
+        "है",
+        "हैं",
+    },
+}
+
+
+def _normalize_retrieval_text(
+    text: str,
+) -> str:
+    text = unicodedata.normalize(
+        "NFKC",
+        str(text),
+    )
+    return " ".join(
+        text.casefold().split()
+    )
+
+
+def _content_query_terms(
+    query: str,
+    language: str,
+) -> list[str]:
+    stop = QUESTION_TERMS.get(
+        language,
+        set(),
+    )
+    tokens = word_splitter(
+        _normalize_retrieval_text(
+            query
+        )
+    )
+    result = []
+    seen = set()
+
+    for token in tokens:
+        if len(token) < 2:
+            continue
+        if token in stop:
+            continue
+        if token in seen:
+            continue
+
+        seen.add(token)
+        result.append(token)
+
+    return result
+
+
 # =============================================================================
-# BM25
+# BM25 ENGINE (V3 MULTI-VIEW)
 # =============================================================================
 
 class BM25Engine:
@@ -271,6 +380,7 @@ class BM25Engine:
         self,
         language,
     ):
+        self.language = language
 
         cfg = CFG[
             language
@@ -292,19 +402,14 @@ class BM25Engine:
             "chunk_text",
             "content",
         ]:
-
             if candidate in schema:
-
                 text_col = candidate
                 break
 
-
         if text_col is None:
-
             raise RuntimeError(
                 f"No text column in {path}"
             )
-
 
         read_columns = [
             "parent_id",
@@ -316,17 +421,14 @@ class BM25Engine:
         )
 
         if has_chunk_id:
-
             read_columns.append(
                 "chunk_id"
             )
-
 
         df = pd.read_parquet(
             path,
             columns=read_columns,
         )
-
 
         self.parent_ids = (
             df[
@@ -335,7 +437,6 @@ class BM25Engine:
             .astype(str)
             .tolist()
         )
-
 
         self.chunk_texts = (
             df[
@@ -346,9 +447,7 @@ class BM25Engine:
             .tolist()
         )
 
-
         if has_chunk_id:
-
             self.chunk_ids = (
                 df[
                     "chunk_id"
@@ -356,9 +455,7 @@ class BM25Engine:
                 .astype(str)
                 .tolist()
             )
-
         else:
-
             self.chunk_ids = [
                 f"{language}_row_{i}"
                 for i in range(
@@ -366,16 +463,13 @@ class BM25Engine:
                 )
             ]
 
-
         self.tokenizer = (
             Tokenizer(
                 stemmer=None,
                 stopwords=[],
-                splitter=
-                    word_splitter,
+                splitter=word_splitter,
             )
         )
-
 
         print(
             f"Building "
@@ -383,303 +477,388 @@ class BM25Engine:
             f"over {len(self.chunk_texts):,} chunks..."
         )
 
-
         corpus_tokens = (
             self.tokenizer.tokenize(
                 self.chunk_texts,
-                return_as=
-                    "tuple",
+                return_as="tuple",
             )
         )
-
 
         self.retriever = (
             bm25s.BM25(
-                k1=
-                    cfg[
-                        "bm25_k1"
-                    ],
-
-                b=
-                    cfg[
-                        "bm25_b"
-                    ],
-
-                method=
-                    "lucene",
+                k1=cfg["bm25_k1"],
+                b=cfg["bm25_b"],
+                method="lucene",
             )
         )
-
 
         self.retriever.index(
             corpus_tokens,
             show_progress=False,
         )
 
+        self.chunk_count = len(
+            self.chunk_texts
+        )
 
-        self.chunk_count = (
-            len(
-                self.chunk_texts
+    def idf_proxy(
+        self,
+        token: str,
+    ) -> float:
+        token = str(token).casefold()
+        vocab = getattr(
+            self.retriever,
+            "vocab_dict",
+            {},
+        )
+        token_id = vocab.get(token)
+        if token_id is None:
+            return 0.0
+
+        scores = getattr(
+            self.retriever,
+            "scores",
+            None,
+        )
+        if not scores:
+            return 0.0
+
+        indptr = scores.get("indptr")
+        num_docs = int(
+            scores.get(
+                "num_docs",
+                self.chunk_count,
             )
         )
+        if (
+            indptr is None
+            or token_id + 1 >= len(indptr)
+        ):
+            return 0.0
+
+        df = int(
+            indptr[token_id + 1]
+            - indptr[token_id]
+        )
+        if df <= 0:
+            return 0.0
+
+        return math.log(
+            1.0
+            + (num_docs + 1)
+            / (df + 1)
+        )
+
+    def select_anchor_terms(
+        self,
+        query: str,
+        language: str,
+        max_terms: int = MAX_ANCHOR_TERMS,
+    ) -> list[str]:
+        terms = _content_query_terms(
+            query,
+            language,
+        )
+        if not terms:
+            return []
+
+        scored = []
+        for position, term in enumerate(terms):
+            idf = self.idf_proxy(term)
+            if idf <= 0:
+                continue
+            scored.append(
+                (
+                    idf,
+                    position,
+                    term,
+                )
+            )
+
+        if not scored:
+            return terms[:max_terms]
+
+        # Highest-IDF terms are most informative.
+        selected = sorted(
+            scored,
+            key=lambda item: (
+                -item[0],
+                item[1],
+            ),
+        )[:max_terms]
+
+        # Restore natural query order.
+        selected.sort(
+            key=lambda item: item[1]
+        )
+
+        return [
+            term
+            for _, _, term in selected
+        ]
+
+    def build_query_views(
+        self,
+        query: str,
+        language: str,
+    ) -> list[dict]:
+        query = _normalize_retrieval_text(query)
+        anchors = self.select_anchor_terms(
+            query,
+            language,
+        )
+        views = [
+            {
+                "name": "full",
+                "text": query,
+                "anchors": anchors,
+            }
+        ]
+
+        if anchors:
+            anchor_query = " ".join(anchors)
+            # Adaptive fast-path: Only trigger 4-lane multi-view if anchor query
+            # contains at least one strong rare/entity term (IDF >= 2.0).
+            has_strong_entity = any(
+                self.idf_proxy(term) >= 2.0
+                for term in anchors
+            )
+            if (
+                anchor_query
+                and anchor_query != query
+                and has_strong_entity
+            ):
+                views.append(
+                    {
+                        "name": "anchor",
+                        "text": anchor_query,
+                        "anchors": anchors,
+                    }
+                )
+
+        return views
 
 
     def search_with_evidence(
         self,
         query,
+        views=None,
     ):
-
-        start = (
-            time.perf_counter()
-        )
-
-
-        tokens = (
-            self.tokenizer.tokenize(
-                [query],
-                update_vocab=False,
-                return_as="tuple",
+        start = time.perf_counter()
+        if views is None:
+            views = self.build_query_views(
+                query,
+                self.language,
             )
+
+        texts = [view["text"] for view in views]
+        tokens = self.tokenizer.tokenize(
+            texts,
+            update_vocab=False,
+            return_as="tuple",
         )
 
-
-        indices, scores = (
-            self.retriever.retrieve(
-                tokens,
-
-                k=min(
-                    BM25_CHUNK_K,
-                    self.chunk_count,
-                ),
-            )
+        indices, scores = self.retriever.retrieve(
+            tokens,
+            k=min(
+                BM25_CHUNK_K,
+                self.chunk_count,
+            ),
         )
 
-
-        parents = []
-        seen = set()
+        rankings = {}
         evidence = {}
 
+        for view_index, view in enumerate(views):
+            name = view["name"]
+            parents = []
+            seen = set()
 
-        for chunk_index, score in zip(
-            indices[0],
-            scores[0],
-        ):
-
-            score = float(score)
-
-            if score <= 0:
-                continue
-
-
-            idx = int(
-                chunk_index
-            )
-
-            parent_id = (
-                self.parent_ids[
-                    idx
-                ]
-            )
-
-
-            if parent_id in seen:
-                continue
-
-
-            seen.add(
-                parent_id
-            )
-
-            parents.append(
-                parent_id
-            )
-
-
-            evidence[
-                parent_id
-            ] = {
-                "parent_id":
-                    parent_id,
-
-                "chunk_id":
-                    self.chunk_ids[
-                        idx
-                    ],
-
-                "text":
-                    self.chunk_texts[
-                        idx
-                    ],
-
-                "score":
-                    score,
-
-                "lane":
-                    "bm25",
-
-                "rank":
-                    len(parents),
-            }
-
-
-            if (
-                len(parents)
-                >=
-                SPARSE_PARENT_K
+            for chunk_index, raw_score in zip(
+                indices[view_index],
+                scores[view_index],
             ):
-                break
+                raw_score = float(raw_score)
+                if raw_score <= 0:
+                    continue
 
+                idx = int(chunk_index)
+                parent_id = self.parent_ids[idx]
+
+                if parent_id in seen:
+                    continue
+
+                seen.add(parent_id)
+                parents.append(parent_id)
+
+                candidate = {
+                    "parent_id": parent_id,
+                    "chunk_id": self.chunk_ids[idx],
+                    "text": self.chunk_texts[idx],
+                    "score": raw_score,
+                    "lane": f"bm25_{name}",
+                    "rank": len(parents),
+                }
+
+                current = evidence.get(parent_id)
+                if (
+                    current is None
+                    or raw_score > float(current.get("score", 0.0))
+                ):
+                    if current is not None:
+                        candidate["alternate"] = current
+                    evidence[parent_id] = candidate
+
+                if len(parents) >= SPARSE_PARENT_K:
+                    break
+
+            rankings[f"sparse_{name}"] = parents
 
         elapsed_ms = (
-            (
-                time.perf_counter()
-                -
-                start
-            )
-            *
-            1000
+            time.perf_counter() - start
+        ) * 1000
+
+        return {
+            "rankings": rankings,
+            "evidence": evidence,
+            "views": views,
+            "elapsed_ms": elapsed_ms,
+        }
+
+    def alignment_features(
+        self,
+        query: str,
+        text: str,
+        language: str,
+        anchors: list[str],
+    ):
+        query_terms = _content_query_terms(
+            query,
+            language,
+        )
+        evidence_terms = word_splitter(
+            _normalize_retrieval_text(text)
         )
 
+        if not query_terms:
+            return 0.0, 0.0
+
+        total_weight = 0.0
+        matched_weight = 0.0
+
+        for term in query_terms:
+            idf = self.idf_proxy(term)
+            weight = max(
+                1.0,
+                min(idf, 8.0),
+            )
+            total_weight += weight
+            if any(
+                _token_matches(
+                    term,
+                    candidate,
+                    language,
+                )
+                for candidate in evidence_terms
+            ):
+                matched_weight += weight
+
+        query_coverage = (
+            matched_weight / total_weight
+            if total_weight
+            else 0.0
+        )
+
+        if not anchors:
+            anchor_coverage = 0.0
+        else:
+            matched = 0
+            for anchor in anchors:
+                if any(
+                    _token_matches(
+                        anchor,
+                        token,
+                        language,
+                    )
+                    for token in evidence_terms
+                ):
+                    matched += 1
+            anchor_coverage = (
+                matched / len(anchors)
+            )
 
         return (
-            parents,
-            elapsed_ms,
-            evidence,
+            query_coverage,
+            anchor_coverage,
         )
-
 
     def search(
         self,
         query,
     ):
-
-        (
-            parents,
-            elapsed_ms,
-            _,
-        ) = (
-            self.search_with_evidence(
-                query
-            )
+        res = self.search_with_evidence(query)
+        # Compatibility fallback for first sparse view
+        sparse_parents = next(
+            iter(res["rankings"].values()),
+            [],
         )
-
         return (
-            parents,
-            elapsed_ms,
+            sparse_parents,
+            res["elapsed_ms"],
         )
 
 
+
+def _token_matches(
+    query_token: str,
+    evidence_token: str,
+    language: str,
+) -> bool:
+    if query_token == evidence_token:
+        return True
+    if language != "ta":
+        return False
+    a = query_token
+    b = evidence_token
+    shortest = min(len(a), len(b))
+    if shortest < 5:
+        return False
+    common = 0
+    for ca, cb in zip(a, b):
+        if ca != cb:
+            break
+        common += 1
+    return common >= 4 and (common / shortest) >= 0.70
+
+
 # =============================================================================
-# WEIGHTED RRF — FROZEN
+# WEIGHTED RRF MULTI-LANE (V3)
 # =============================================================================
 
-def weighted_rrf(
-    dense,
-    sparse,
-    language,
+def weighted_rrf_multi(
+    rankings: dict[str, list[str]],
+    weights: dict[str, float],
+    k: float = RRF_K_V3,
 ):
-
-    cfg = CFG[
-        language
-    ]
-
     scores = {}
+    lane_membership = {}
+    for lane, parents in rankings.items():
+        weight = float(weights.get(lane, 1.0))
+        for rank, parent in enumerate(parents[:FUSION_DEPTH], start=1):
+            contribution = weight / (k + rank)
+            scores[parent] = scores.get(parent, 0.0) + contribution
+            lane_membership.setdefault(parent, set()).add(lane)
 
+    ordered = sorted(
+        scores,
+        key=lambda parent: (-scores[parent], parent),
+    )
+    return (
+        ordered[:FUSION_CANDIDATE_K],
+        scores,
+        lane_membership,
+    )
 
-    for rank0, parent in enumerate(
-        dense[
-            :FUSION_DEPTH
-        ]
-    ):
-
-        contribution = (
-            1.0
-            /
-            (
-                cfg[
-                    "rrf_k"
-                ]
-                +
-                (
-                    rank0 + 1
-                )
-                /
-                cfg[
-                    "dense_weight"
-                ]
-                -
-                1
-            )
-        )
-
-
-        scores[
-            parent
-        ] = (
-            scores.get(
-                parent,
-                0.0,
-            )
-            +
-            contribution
-        )
-
-
-    for rank0, parent in enumerate(
-        sparse[
-            :FUSION_DEPTH
-        ]
-    ):
-
-        contribution = (
-            1.0
-            /
-            (
-                cfg[
-                    "rrf_k"
-                ]
-                +
-                (
-                    rank0 + 1
-                )
-                /
-                cfg[
-                    "sparse_weight"
-                ]
-                -
-                1
-            )
-        )
-
-
-        scores[
-            parent
-        ] = (
-            scores.get(
-                parent,
-                0.0,
-            )
-            +
-            contribution
-        )
-
-
-    return [
-        parent
-
-        for parent, _
-        in sorted(
-            scores.items(),
-
-            key=lambda item:
-                (
-                    -item[1],
-                    item[0],
-                ),
-        )[
-            :FINAL_PARENT_K
-        ]
-    ]
 
 
 # =============================================================================
@@ -1210,6 +1389,49 @@ class ContextStore:
 
         return unique
 
+    def best_candidate(
+        self,
+        language,
+        query,
+        parent,
+        evidence_by_parent,
+    ):
+        candidates = self._all_parent_candidates(
+            language,
+            str(parent),
+            evidence_by_parent,
+        )
+        if not candidates:
+            return None
+
+        selected = max(
+            candidates,
+            key=lambda candidate: evidence_pack_score(
+                query,
+                candidate["text"],
+                language,
+            ),
+        )
+
+        snippet = evidence_window(
+            selected["text"],
+            query,
+            PER_CHUNK_CHARS,
+            language,
+        )
+
+        if not snippet:
+            return None
+
+        return {
+            "candidate": selected,
+            "snippet": snippet,
+            "evidence_score": evidence_pack_score(
+                query,
+                snippet,
+                language,
+            ),
+        }
 
     def build(
         self,
@@ -1229,10 +1451,11 @@ class ContextStore:
         used_evidence = []
         used_chars = 0
 
-        # IMPORTANT: preserve weighted-RRF parent order.
-        # We may choose the best child *inside* an already-retrieved parent,
-        # but we do not reorder the fused parents with a second heuristic ranker.
+        # Parents arrive already query-aware reranked by Retrieval V3.
+        # Preserve this final reranked order while selecting the best
+        # child/sibling inside each parent.
         for parent in parents:
+
 
             if len(blocks) >= max_parents:
                 break
@@ -1635,411 +1858,256 @@ class FullRAG:
     # RETRIEVAL
     # =========================================================================
 
+    def _rerank_parents(
+        self,
+        *,
+        query,
+        language,
+        parents,
+        evidence_by_parent,
+        rrf_scores,
+        lane_membership,
+        anchors,
+    ):
+        records = []
+        for parent in parents[:RERANK_PARENT_K]:
+            best = self.contexts.best_candidate(
+                language,
+                query,
+                parent,
+                evidence_by_parent,
+            )
+            if not best:
+                continue
+
+            snippet = best["snippet"]
+            query_coverage, anchor_coverage = self.bm25[language].alignment_features(
+                query,
+                snippet,
+                language,
+                anchors,
+            )
+
+            lanes = lane_membership.get(parent, set())
+            dense_hit = any(lane.startswith("dense") for lane in lanes)
+            sparse_hit = any(lane.startswith("sparse") for lane in lanes)
+            agreement = float(dense_hit and sparse_hit)
+
+            normalized_query = _normalize_retrieval_text(query)
+            normalized_snippet = _normalize_retrieval_text(snippet)
+            anchor_phrase = " ".join(anchors) if anchors else ""
+            phrase_hit = float(
+                bool(anchor_phrase and anchor_phrase in normalized_snippet)
+            )
+
+            records.append({
+                "parent": parent,
+                "rrf_raw": float(rrf_scores.get(parent, 0.0)),
+                "evidence_raw": float(best["evidence_score"]),
+                "query_coverage": query_coverage,
+                "anchor_coverage": anchor_coverage,
+                "agreement": agreement,
+                "phrase_hit": phrase_hit,
+                "snippet": snippet,
+            })
+
+        if not records:
+            return [], {}
+
+        def minmax(key):
+            values = [row[key] for row in records]
+            lo = min(values)
+            hi = max(values)
+            if abs(hi - lo) < 1e-9:
+                return {row["parent"]: 0.5 for row in records}
+            return {row["parent"]: (row[key] - lo) / (hi - lo) for row in records}
+
+        rrf_norm = minmax("rrf_raw")
+        evidence_norm = minmax("evidence_raw")
+
+        metadata = {}
+        for row in records:
+            parent = row["parent"]
+            score = (
+                RR_WEIGHT * rrf_norm[parent]
+                + ANCHOR_WEIGHT * row["anchor_coverage"]
+                + QUERY_COVERAGE_WEIGHT * row["query_coverage"]
+                + EVIDENCE_WEIGHT * evidence_norm[parent]
+                + LANE_AGREEMENT_WEIGHT * row["agreement"]
+                + PHRASE_WEIGHT * row["phrase_hit"]
+            )
+            if anchors and row["anchor_coverage"] == 0.0:
+                score -= ANCHOR_MISS_PENALTY
+
+            row["final_score"] = score
+            metadata[parent] = row
+
+        records.sort(
+            key=lambda row: (-row["final_score"], row["parent"])
+        )
+
+        reranked = [row["parent"] for row in records[:FINAL_PARENT_K]]
+        return reranked, metadata
+
+    # =========================================================================
+    # RETRIEVAL (V3 MULTI-VIEW ANCHOR-AWARE)
+    # =========================================================================
+
     def retrieve(
         self,
         query,
-        language,
+        language="ta",
     ):
+        overall = time.perf_counter()
 
-        overall = (
-            time.perf_counter()
+        views = self.bm25[language].build_query_views(query, language)
+
+        sparse_future = self.executor.submit(
+            self.bm25[language].search_with_evidence,
+            query,
+            views,
         )
-
-
-        sparse_future = (
-            self.executor.submit(
-                self.bm25[
-                    language
-                ].search_with_evidence,
-                query,
-            )
-        )
-
 
         torch.cuda.synchronize()
+        embed_start = time.perf_counter()
 
-        embed_start = (
-            time.perf_counter()
+        query_texts = [view["text"] for view in views]
+        vectors = self.embedder.encode(
+            query_texts,
+            prompt_name="query",
+            truncate_dim=EMBED_DIM,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
         )
-
-
-        vector = (
-            self.embedder.encode(
-                [query],
-
-                prompt_name=
-                    "query",
-
-                truncate_dim=
-                    EMBED_DIM,
-
-                normalize_embeddings=
-                    True,
-
-                convert_to_numpy=
-                    True,
-
-                show_progress_bar=
-                    False,
-            )[0]
-        )
-
 
         torch.cuda.synchronize()
+        embed_ms = (time.perf_counter() - embed_start) * 1000
 
-
-        embed_ms = (
-            (
-                time.perf_counter()
-                -
-                embed_start
-            )
-            *
-            1000
-        )
-
-
-        dense_start = (
-            time.perf_counter()
-        )
-
-
-        response = (
-            self.qdrant.query_points(
-                collection_name=
-                    CFG[
-                        language
-                    ][
-                        "collection"
-                    ],
-
-                query=
-                    vector.tolist(),
-
-                limit=
-                    DENSE_CHILD_K,
-
-                with_payload=[
-                    "parent_id",
-                    "chunk_id",
-                ],
-
-                with_vectors=
-                    False,
-
-                search_params=
-                    models.SearchParams(
-                        hnsw_ef=
-                            HNSW_EF,
-
-                        exact=
-                            False,
-
-                        indexed_only=
-                            True,
-                    ),
-            )
-        )
-
-
-        dense = []
-        seen = set()
+        dense_start = time.perf_counter()
+        dense_rankings = {}
         dense_evidence = {}
 
-
-        for point in response.points:
-
-            payload = (
-                point.payload
-                or {}
+        def _execute_qdrant_view(v_item):
+            v, vec = v_item
+            res = self.qdrant.query_points(
+                collection_name=CFG[language]["collection"],
+                query=vec.tolist(),
+                limit=DENSE_CHILD_K,
+                with_payload=["parent_id", "chunk_id"],
+                with_vectors=False,
+                search_params=models.SearchParams(
+                    hnsw_ef=HNSW_EF,
+                    exact=False,
+                    indexed_only=True,
+                ),
             )
+            return v, res
+
+        items = list(zip(views, vectors))
+        if len(items) > 1:
+            with ThreadPoolExecutor(max_workers=len(items)) as q_executor:
+                qdrant_results = list(q_executor.map(_execute_qdrant_view, items))
+        else:
+            qdrant_results = [_execute_qdrant_view(items[0])]
+
+        for view, response in qdrant_results:
+            parents = []
+            seen = set()
+            view_name = view["name"]
+
+            for point in response.points:
+                payload = point.payload or {}
+                parent = str(payload.get("parent_id", ""))
+                if not parent or parent in seen:
+                    continue
+
+                seen.add(parent)
+                parents.append(parent)
+
+                candidate = {
+                    "parent_id": parent,
+                    "chunk_id": str(payload.get("chunk_id", "")),
+                    "score": float(point.score),
+                    "lane": f"dense_{view_name}",
+                    "rank": len(parents),
+                }
+
+                current = dense_evidence.get(parent)
+                if current is None:
+                    dense_evidence[parent] = candidate
+                else:
+                    candidate["alternate"] = current
+                    dense_evidence[parent] = candidate
+
+                if len(parents) >= DENSE_PARENT_K:
+                    break
+
+            dense_rankings[f"dense_{view_name}"] = parents
+
+        dense_ms = (time.perf_counter() - dense_start) * 1000
 
 
-            parent = str(
-                payload.get(
-                    "parent_id",
-                    "",
-                )
-            )
+        sparse_result = sparse_future.result()
 
+        rankings = {}
+        rankings.update(dense_rankings)
+        rankings.update(sparse_result["rankings"])
 
-            if (
-                not parent
-                or
-                parent in seen
-            ):
-                continue
-
-
-            seen.add(
-                parent
-            )
-
-
-            dense.append(
-                parent
-            )
-
-
-            dense_evidence[
-                parent
-            ] = {
-                "parent_id":
-                    parent,
-
-                "chunk_id":
-                    str(
-                        payload.get(
-                            "chunk_id",
-                            "",
-                        )
-                    ),
-
-                "score":
-                    float(
-                        point.score
-                    ),
-
-                "lane":
-                    "dense",
-
-                "rank":
-                    len(dense),
-            }
-
-
-            if (
-                len(dense)
-                >=
-                DENSE_PARENT_K
-            ):
-                break
-
-
-        dense_ms = (
-            (
-                time.perf_counter()
-                -
-                dense_start
-            )
-            *
-            1000
-        )
-
-
-        (
-            sparse,
-            bm25_ms,
-            sparse_evidence,
-        ) = (
-            sparse_future.result()
-        )
-
-
-        fused = weighted_rrf(
-            dense,
-            sparse,
-            language,
-        )
-
-
-        cfg = CFG[
-            language
-        ]
-
-
-        dense_rank = {
-            parent:
-                rank
-
-            for rank, parent
-            in enumerate(
-                dense,
-                start=1,
-            )
+        cfg = CFG[language]
+        weights = {
+            "dense_full": cfg["dense_weight"] * DENSE_FULL_WEIGHT,
+            "dense_anchor": cfg["dense_weight"] * DENSE_ANCHOR_WEIGHT,
+            "sparse_full": cfg["sparse_weight"] * SPARSE_FULL_WEIGHT,
+            "sparse_anchor": cfg["sparse_weight"] * SPARSE_ANCHOR_WEIGHT,
         }
 
-
-        sparse_rank = {
-            parent:
-                rank
-
-            for rank, parent
-            in enumerate(
-                sparse,
-                start=1,
-            )
-        }
-
-
-        def _rrf_contribution(
-            rank,
-            weight,
-        ):
-
-            if rank is None:
-                return 0.0
-
-
-            return (
-                1.0
-                /
-                (
-                    cfg[
-                        "rrf_k"
-                    ]
-                    +
-                    rank
-                    /
-                    weight
-                    -
-                    1
-                )
-            )
-
-
-        evidence_by_parent = {}
-
-
-        for parent in fused:
-
-            dense_info = (
-                dense_evidence.get(
-                    parent
-                )
-            )
-
-
-            sparse_info = (
-                sparse_evidence.get(
-                    parent
-                )
-            )
-
-
-            dense_contrib = (
-                _rrf_contribution(
-                    dense_rank.get(
-                        parent
-                    ),
-
-                    cfg[
-                        "dense_weight"
-                    ],
-                )
-            )
-
-
-            sparse_contrib = (
-                _rrf_contribution(
-                    sparse_rank.get(
-                        parent
-                    ),
-
-                    cfg[
-                        "sparse_weight"
-                    ],
-                )
-            )
-
-
-            if (
-                dense_info
-                and
-                dense_contrib
-                >=
-                sparse_contrib
-            ):
-
-                selected = dict(
-                    dense_info
-                )
-
-
-                if sparse_info:
-
-                    selected[
-                        "alternate"
-                    ] = (
-                        sparse_info
-                    )
-
-
-                evidence_by_parent[
-                    parent
-                ] = (
-                    selected
-                )
-
-
-            elif sparse_info:
-
-                selected = dict(
-                    sparse_info
-                )
-
-
-                if dense_info:
-
-                    selected[
-                        "alternate"
-                    ] = (
-                        dense_info
-                    )
-
-
-                evidence_by_parent[
-                    parent
-                ] = (
-                    selected
-                )
-
-
-            elif dense_info:
-
-                evidence_by_parent[
-                    parent
-                ] = dict(
-                    dense_info
-                )
-
-
-        retrieval_ms = (
-            (
-                time.perf_counter()
-                -
-                overall
-            )
-            *
-            1000
+        fused_candidates, rrf_scores, lane_membership = weighted_rrf_multi(
+            rankings,
+            weights,
         )
 
+        evidence_candidates = {}
+        for source in (dense_evidence, sparse_result["evidence"]):
+            for parent, candidate in source.items():
+                if parent not in evidence_candidates:
+                    evidence_candidates[parent] = candidate
+                else:
+                    current = evidence_candidates[parent]
+                    merged = dict(candidate)
+                    merged["alternate"] = current
+                    evidence_candidates[parent] = merged
+
+        anchors = views[0].get("anchors", [])
+
+        rerank_start = time.perf_counter()
+        reranked, rerank_metadata = self._rerank_parents(
+            query=query,
+            language=language,
+            parents=fused_candidates,
+            evidence_by_parent=evidence_candidates,
+            rrf_scores=rrf_scores,
+            lane_membership=lane_membership,
+            anchors=anchors,
+        )
+        rerank_ms = (time.perf_counter() - rerank_start) * 1000
+
+        retrieval_ms = (time.perf_counter() - overall) * 1000
 
         return {
-            "parents":
-                fused,
-
-            "dense_parents":
-                dense,
-
-            "sparse_parents":
-                sparse,
-
-            "evidence_by_parent":
-                evidence_by_parent,
-
-            "embed_ms":
-                embed_ms,
-
-            "dense_ms":
-                dense_ms,
-
-            "bm25_ms":
-                bm25_ms,
-
-            "retrieval_ms":
-                retrieval_ms,
+            "parents": reranked,
+            "pre_rerank_parents": fused_candidates,
+            "rankings": rankings,
+            "evidence_by_parent": evidence_candidates,
+            "rerank_metadata": rerank_metadata,
+            "anchors": anchors,
+            "embed_ms": embed_ms,
+            "dense_ms": dense_ms,
+            "bm25_ms": sparse_result["elapsed_ms"],
+            "rerank_ms": rerank_ms,
+            "retrieval_ms": retrieval_ms,
         }
+
 
 
     # =========================================================================
