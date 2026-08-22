@@ -297,6 +297,204 @@ def _clean_answer(
 
 
 # =============================================================================
+# =============================================================================
+# GROUNDING NORMALIZATION & MORPHOLOGY
+# =============================================================================
+
+def _normalize_grounding_text(
+    text: str,
+) -> str:
+    text = unicodedata.normalize(
+        "NFKC",
+        str(text),
+    )
+    text = text.casefold()
+    text = re.sub(
+        r"[^\w\s\u0900-\u097F\u0B80-\u0BFF]",
+        " ",
+        text,
+    )
+    return " ".join(
+        text.split()
+    )
+
+
+def _strip_answer_suffixes(
+    answer: str,
+) -> str:
+    answer = _normalize_grounding_text(
+        answer
+    )
+    suffixes = (
+        " ஆகும்",
+        " என்பது",
+        " தான்",
+        " உள்ளது",
+        " கொண்டுள்ளது",
+        " இருக்கிறது",
+        " है",
+        " हैं",
+        " था",
+        " थी",
+        " थे",
+    )
+    for suffix in suffixes:
+        if answer.endswith(suffix):
+            answer = (
+                answer[:-len(suffix)]
+                .strip()
+            )
+    return answer
+
+
+def _token_supported(
+    answer_token: str,
+    evidence_tokens: list[str],
+) -> bool:
+    if not answer_token:
+        return False
+
+    # Numbers must match exactly.
+    if answer_token.isdigit():
+        return answer_token in evidence_tokens
+
+    for evidence_token in evidence_tokens:
+        if answer_token == evidence_token:
+            return True
+
+        shortest = min(
+            len(answer_token),
+            len(evidence_token),
+        )
+
+        # Avoid matching tiny words.
+        if shortest < 4:
+            continue
+
+        common = 0
+        for a, b in zip(
+            answer_token,
+            evidence_token,
+        ):
+            if a != b:
+                break
+            common += 1
+
+        ratio = (
+            common
+            / max(1, len(answer_token))
+        )
+
+        if (
+            common >= 4
+            and ratio >= 0.70
+        ):
+            return True
+
+    return False
+
+
+def answer_is_grounded(
+    answer: str,
+    evidence: str,
+) -> bool:
+    if not answer:
+        return False
+
+    if str(answer).strip().upper() == "NOT_FOUND":
+        return True
+
+    answer_norm = (
+        _strip_answer_suffixes(
+            answer
+        )
+    )
+
+    evidence_norm = (
+        _normalize_grounding_text(
+            evidence
+        )
+    )
+
+    if not answer_norm or not evidence_norm:
+        return False
+
+    # Strongest and safest check.
+    if answer_norm in evidence_norm:
+        return True
+
+    answer_tokens = (
+        answer_norm.split()
+    )
+
+    evidence_tokens = (
+        evidence_norm.split()
+    )
+
+    if not answer_tokens:
+        return False
+
+    return all(
+        _token_supported(
+            token,
+            evidence_tokens,
+        )
+        for token in answer_tokens
+    )
+
+
+# =============================================================================
+# QUESTION TYPE VALIDATION
+# =============================================================================
+
+NUMBER_QUESTION_MARKERS = {
+    "ta": (
+        "எத்தனை",
+        "எவ்வளவு",
+    ),
+
+    "hi": (
+        "कितने",
+        "कितना",
+        "कितनी",
+    ),
+}
+
+
+def query_expects_number(
+    query: str,
+    language: str,
+) -> bool:
+    q = str(query).casefold()
+    return any(
+        marker in q
+        for marker in NUMBER_QUESTION_MARKERS.get(
+            language,
+            (),
+        )
+    )
+
+
+def answer_type_is_valid(
+    query: str,
+    answer: str,
+    language: str,
+) -> bool:
+    if query_expects_number(
+        query,
+        language,
+    ):
+        return bool(
+            re.search(
+                r"\d",
+                str(answer),
+            )
+        )
+
+    return True
+
+
+# =============================================================================
 # ANSWER CONTAINMENT
 # =============================================================================
 
@@ -304,52 +502,9 @@ def _answer_inside_unit(
     answer: str,
     unit: str,
 ) -> bool:
-
-    answer_cf = (
-        answer.casefold()
-    )
-
-    unit_cf = (
-        unit.casefold()
-    )
-
-
-    if (
-        answer_cf
-        and
-        answer_cf in unit_cf
-    ):
-        return True
-
-
-    answer_terms = [
-        term
-        for term in split_terms(
-            answer
-        )
-        if len(term) >= 2
-    ]
-
-
-    unit_terms = split_terms(
-        unit
-    )
-
-
-    if not answer_terms:
-        return False
-
-
-    # Every meaningful answer term must be supported.
-    return all(
-        any(
-            term_matches(
-                answer_term,
-                unit_term,
-            )
-            for unit_term in unit_terms
-        )
-        for answer_term in answer_terms
+    return answer_is_grounded(
+        answer,
+        unit,
     )
 
 
@@ -368,31 +523,29 @@ def _answer_supported(
     if not answer:
         return False
 
-
     for unit in candidate_evidence_units(
         context
     ):
-
         signal = support_for_unit(
             query,
             unit,
             language,
         )
 
-
         if not signal.strong:
             continue
-
 
         if _answer_inside_unit(
             answer,
             unit,
         ):
-
             return True
 
-
-    return False
+    # Fallback to general grounded check on the overall context
+    return answer_is_grounded(
+        answer,
+        context,
+    )
 
 
 # =============================================================================
@@ -412,10 +565,8 @@ def _question_echo(
         query
     )
 
-
     if not answer_terms:
         return True
-
 
     has_novel_term = any(
         not any(
@@ -427,7 +578,6 @@ def _question_echo(
         )
         for answer_term in answer_terms
     )
-
 
     return not has_novel_term
 
@@ -441,7 +591,6 @@ def _script_ok(
         language
     )
 
-
     if (
         target
         and target.search(
@@ -450,14 +599,12 @@ def _script_ok(
     ):
         return True
 
-
     # Numbers and standard scientific Latin notation are okay.
     if re.search(
         r"[A-Za-z0-9°%]",
         answer,
     ):
         return True
-
 
     return False
 
@@ -470,7 +617,6 @@ def _repetition_bad(
         answer
     )
 
-
     for (
         left,
         middle,
@@ -480,17 +626,12 @@ def _repetition_bad(
         terms[1:],
         terms[2:],
     ):
-
         if (
             left
-            ==
-            middle
-            ==
-            right
+            == middle
+            == right
         ):
-
             return True
-
 
     return False
 
@@ -504,10 +645,15 @@ def _candidate_shape_ok(
     if not candidate:
         return False
 
-
     if len(candidate) > 90:
         return False
 
+    if not answer_type_is_valid(
+        query,
+        candidate,
+        language,
+    ):
+        return False
 
     if _question_echo(
         candidate,
@@ -515,21 +661,19 @@ def _candidate_shape_ok(
     ):
         return False
 
-
     if not _script_ok(
         candidate,
         language,
     ):
         return False
 
-
     if _repetition_bad(
         candidate
     ):
         return False
 
-
     return True
+
 
 
 # =============================================================================
@@ -870,7 +1014,19 @@ class Guardrails:
         not_found_response_text
     )
 
+    answer_is_grounded = staticmethod(
+        answer_is_grounded
+    )
+
+    answer_type_is_valid = staticmethod(
+        answer_type_is_valid
+    )
+
+    query_expects_number = staticmethod(
+        query_expects_number
+    )
+
 
 guardrails = (
     Guardrails()
-)
+)

@@ -1355,38 +1355,36 @@ def _answer_is_grounded(
 
 def _clean_short_answer(answer: str) -> str:
     """Remove common tiny-model wrappers without rewriting the answer."""
+    return _clean_generated_answer(answer)
 
-    answer = str(answer).strip()
 
-    if not answer:
-        return ""
-
-    first_line = next(
-        (
-            line.strip()
-            for line in answer.splitlines()
-            if line.strip()
-        ),
-        "",
+def _clean_generated_answer(
+    answer: str,
+) -> str:
+    answer = (
+        str(answer)
+        .strip()
     )
 
-    for prefix in (
+    prefixes = (
         "Answer:",
         "answer:",
-        "उत्तर:",
         "பதில்:",
-    ):
-        if first_line.startswith(prefix):
-            first_line = first_line[len(prefix):].strip()
-            break
+        "উত্তর:",
+    )
 
-    # Avoid accidental explanations after a semicolon/pipe while preserving
-    # punctuation that can legitimately occur inside names or quantities.
-    for separator in (" | ", "; "):
-        if separator in first_line:
-            first_line = first_line.split(separator, 1)[0].strip()
+    for prefix in prefixes:
+        if answer.startswith(prefix):
+            answer = (
+                answer[len(prefix):]
+                .strip()
+            )
 
-    return first_line
+    # Keep NOT_FOUND exact.
+    if answer.upper() == "NOT_FOUND":
+        return "NOT_FOUND"
+
+    return answer
 
 
 def _build_generation_prompt(
@@ -1408,77 +1406,66 @@ def _build_generation_prompt(
 # FIRST TOKEN STREAMER
 # =============================================================================
 
-class FirstTokenStreamer(
+class Seq2SeqFirstTokenStreamer(
     BaseStreamer
 ):
 
     def __init__(
         self,
         tokenizer,
-        is_seq2seq: bool = False,
     ):
-
         self.tokenizer = tokenizer
-        self.is_seq2seq = is_seq2seq
 
-        self.ignore_initial_token = True
+        # mT0 first emits decoder start token.
+        self.ignore_initial = True
 
         self.first_token_at = None
         self.completed_at = None
 
         self.generated_ids = []
-
-        self.done = (
-            threading.Event()
-        )
-
+        self.done = threading.Event()
 
     def put(
         self,
         value,
     ):
-
         ids = (
             value
             .detach()
             .cpu()
-            .view(-1)
+            .reshape(-1)
             .tolist()
         )
 
-
-        if self.ignore_initial_token:
-
-            self.ignore_initial_token = False
+        if self.ignore_initial:
+            self.ignore_initial = False
             return
 
-
         if self.first_token_at is None:
-
             self.first_token_at = (
                 time.perf_counter()
             )
-
 
         self.generated_ids.extend(
             ids
         )
 
-
     def end(
         self,
     ):
-
         self.completed_at = (
             time.perf_counter()
         )
-
         self.done.set()
+
+
+FirstTokenStreamer = Seq2SeqFirstTokenStreamer
 
 
 # =============================================================================
 # FULL ENGINE
 # =============================================================================
+
 
 class FullRAG:
 
@@ -2059,6 +2046,7 @@ class FullRAG:
     # GENERATION
     # =========================================================================
 
+    @torch.inference_mode()
     def generate(
         self,
         query,
@@ -2069,8 +2057,10 @@ class FullRAG:
 
         stage_start = time.perf_counter()
 
-        if max_new_tokens is None:
-            max_new_tokens = settings.gen_max_new_tokens
+        max_new_tokens = (
+            max_new_tokens
+            or settings.gen_max_new_tokens
+        )
 
         if not str(context).strip():
             return {
@@ -2168,9 +2158,8 @@ class FullRAG:
             time.perf_counter() - stage_start
         ) * 1000
 
-        streamer = FirstTokenStreamer(
-            self.gen_tokenizer,
-            is_seq2seq=(GEN_BACKEND == "seq2seq"),
+        streamer = Seq2SeqFirstTokenStreamer(
+            self.gen_tokenizer
         )
 
         kwargs = {
@@ -2190,19 +2179,24 @@ class FullRAG:
         torch.cuda.synchronize()
         model_start = time.perf_counter()
 
-        self.generator.generate(
+        outputs = self.generator.generate(
             **kwargs
         )
 
-        if streamer.first_token_at is None:
-            streamer.first_token_at = time.perf_counter()
+        torch.cuda.synchronize()
+        model_complete = time.perf_counter()
+
+        first_token_at = (
+            streamer.first_token_at
+            or model_start
+        )
 
         raw_answer = self.gen_tokenizer.decode(
-            streamer.generated_ids,
+            outputs[0],
             skip_special_tokens=True,
         ).strip()
 
-        answer = _clean_short_answer(
+        answer = _clean_generated_answer(
             raw_answer
         )
 
@@ -2216,15 +2210,17 @@ class FullRAG:
             answer = "NOT_FOUND"
 
         first_token_ms = (
-            streamer.first_token_at - model_start
-        ) * 1000
+            (first_token_at - model_start) * 1000
+            if first_token_at
+            else None
+        )
 
         complete_ms = (
-            (streamer.completed_at or time.perf_counter()) - model_start
+            model_complete - model_start
         ) * 1000
 
-        generated_tokens = len(
-            streamer.generated_ids
+        generated_tokens = int(
+            outputs[0].shape[0]
         )
 
         return {
@@ -2239,15 +2235,22 @@ class FullRAG:
             "prompt_context_chars": len(context),
             "prompt_prep_ms": prep_ms,
             "model_first_token_ms": first_token_ms,
-            "generation_stage_ttft_ms": prep_ms + first_token_ms,
-            "generation_complete_ms": prep_ms + complete_ms,
-            "first_token_at": streamer.first_token_at,
-            "completed_at": streamer.completed_at,
+            "generation_stage_ttft_ms": (
+                (prep_ms + first_token_ms)
+                if first_token_ms is not None
+                else None
+            ),
+            "generation_complete_ms": (
+                prep_ms + complete_ms
+            ),
+            "first_token_at": first_token_at,
+            "completed_at": model_complete,
             "generated_tokens": generated_tokens,
             "possibly_truncated": (
                 generated_tokens >= max_new_tokens
             ),
         }
+
 
 
     # =========================================================================

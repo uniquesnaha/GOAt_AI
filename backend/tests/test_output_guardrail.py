@@ -126,6 +126,70 @@ class OutputGuardrailTests(unittest.TestCase):
         self.assertEqual(answer, "கார்பன் டை ஆக்சைடு")
 
 
+    def test_peacock_supported_generation(self):
+        answer, result = apply_output_guardrail(
+            "இந்திய மயில்",
+            "ta",
+            query="இந்தியாவின் தேசியப் பறவை எது?",
+            context="இந்தியாவின் தேசியப் பறவை இந்திய மயில் ஆகும்.",
+        )
+        self.assertTrue(result.allowed)
+        self.assertIn("மயில்", answer)
+
+    def test_tamil_inflection_grounding_heart(self):
+        from app.guardrails.guardrails import answer_is_grounded
+        self.assertTrue(
+            answer_is_grounded(
+                "இதயம்",
+                "இதயத்தில் இரண்டு பம்புகள் உள்ளன.",
+            )
+        )
+
+    def test_irrelevant_retrieval_abstains(self):
+        answer, result = apply_output_guardrail(
+            "NOT_FOUND",
+            "ta",
+            query="பூமியின் இயற்கை துணைக்கோள் எது?",
+            context="பூமியின் சுற்றுப்பாதை தளம் சூரியனைச் சுற்றி அமைகிறது.",
+        )
+        self.assertFalse(result.allowed)
+        self.assertEqual(result.code, "model_abstained")
+
+    def test_numeric_answer_type_validation(self):
+        from app.guardrails.guardrails import answer_type_is_valid
+        question = "ஒளியின் வேகம் ஒரு வினாடிக்கு தோராயமாக எத்தனை கிலோமீட்டர்?"
+        self.assertFalse(
+            answer_type_is_valid(
+                question,
+                "ஒளி",
+                "ta",
+            )
+        )
+        self.assertTrue(
+            answer_type_is_valid(
+                question,
+                "300000",
+                "ta",
+            )
+        )
+
+    def test_great_bath_mohenjodaro(self):
+        question = "சிந்து சமவெளி நாகரிகத்தின் பெரிய குளியல் குளம் எங்கு கண்டுபிடிக்கப்பட்டது?"
+        context = (
+            "பாகிஸ்தானின் சிந்து மாகாணத்தில் உள்ள மோஹென்ஜோ-தாரோவின் "
+            "அகழ்வாராய்ச்சி செய்யப்பட்ட இடிபாடுகள், முன்புறத்தில் பெரிய குளியல் குளத்தைக் காட்டுகின்றன."
+        )
+        answer, result = apply_output_guardrail(
+            "மோஹென்ஜோ-தாரோ",
+            "ta",
+            query=question,
+            context=context,
+        )
+        self.assertTrue(result.allowed)
+        self.assertIn("மோஹென்ஜோ", answer)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
