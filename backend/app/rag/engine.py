@@ -1,21 +1,25 @@
 """
-RAG serving engine.
+GOAt AI RAG serving engine.
 
-This is a verbatim extraction of the retrieval + context + generation logic
-from the golden reference script
-`scripts/benchmark_full_rag_t4_latency_winner.py` (kept untouched at that
-path forever). Only two things were changed relative to that script:
+Retrieval remains frozen:
+    Qwen3-Embedding-0.6B
+    256d normalized embeddings
+    Qdrant HNSW
+    BM25
+    language-specific weighted RRF
+    Top-20 parent fusion
 
-  1. `ROOT` is read from `app.config.settings.data_root` instead of the
-     Colab-only hardcoded `/content/HH-goa-task2`.
-  2. The Qdrant client points at `app.config.settings.qdrant_url` instead of
-     the hardcoded `http://127.0.0.1:6333`.
+This version changes ONLY downstream evidence packing / tiny-model
+generation behavior.
 
-Retrieval ranking remains identical to the golden script. Context selection
-may prefer the more query-relevant child already present in the frozen fused
-top-20, and generation keeps the question ahead of evidence so tokenizer
-truncation cannot silently remove it. Run the retrieval-only parity gate after
-changes to confirm dense, sparse, and fused rankings are unchanged.
+Quality objectives:
+- preserve <200ms steady-state TTFT as far as possible,
+- no reranker,
+- no second LLM call,
+- no change to retrieval ranking,
+- reduce false NOT_FOUND from Qwen3-0.6B,
+- prevent numbered-list distractor copying,
+- keep unsupported answers blocked.
 """
 
 from __future__ import annotations
@@ -36,19 +40,23 @@ from bm25s.tokenization import Tokenizer
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 from transformers import (
-    AutoTokenizer,
     AutoModelForCausalLM,
+    AutoTokenizer,
 )
 from transformers.generation.streamers import BaseStreamer
 
 from app.config import settings
 from app.rag.evidence_quality import (
-    evidence_relevance_score,
+    evidence_pack_score,
     score_sentence,
     split_sentences,
+    strongest_supporting_sentence,
 )
 
-ROOT = Path(settings.data_root)
+
+ROOT = Path(
+    settings.data_root
+)
 
 
 # =============================================================================
@@ -60,6 +68,7 @@ CORPUS_PROFILE = (
     .strip()
     .lower()
 )
+
 
 if CORPUS_PROFILE == "25k":
 
@@ -77,6 +86,7 @@ if CORPUS_PROFILE == "25k":
             "hhgoa_fixed384_hi",
     }
 
+
 elif CORPUS_PROFILE == "350k":
 
     CHUNK_ROOT = (
@@ -93,6 +103,7 @@ elif CORPUS_PROFILE == "350k":
             "hhgoa_350k_fixed384_hi",
     }
 
+
 else:
 
     raise RuntimeError(
@@ -105,13 +116,11 @@ else:
 CHUNKS = {
     "ta":
         CHUNK_ROOT
-        /
-        "tamil.parquet",
+        / "tamil.parquet",
 
     "hi":
         CHUNK_ROOT
-        /
-        "hindi.parquet",
+        / "hindi.parquet",
 }
 
 
@@ -119,8 +128,13 @@ CHUNKS = {
 # MODELS
 # =============================================================================
 
-EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
-GEN_MODEL = "Qwen/Qwen3-0.6B"
+EMBED_MODEL = (
+    "Qwen/Qwen3-Embedding-0.6B"
+)
+
+GEN_MODEL = (
+    "Qwen/Qwen3-0.6B"
+)
 
 EMBED_DIM = 256
 QUERY_MAX_LENGTH = 256
@@ -188,32 +202,36 @@ FINAL_PARENT_K = 20
 
 HNSW_EF = 64
 
+
 # =============================================================================
-# FROZEN CONTEXT & GENERATION CONFIG (LATENCY WINNER)
+# CONTEXT / GENERATION CONFIG
 # =============================================================================
 
-CONTEXT_CHAR_BUDGET = 750
-MAX_CONTEXT_PARENTS = 3
+# Important correction:
+#
+# 220 + "\n\n" + 220 = 442
+#
+# The previous 440 budget could silently reject a full second block.
+#
+# 450 allows two 220-character blocks while staying very compact.
+CONTEXT_CHAR_BUDGET = 450
+MAX_CONTEXT_PARENTS = 2
+PER_CHUNK_CHARS = 220
 
-# Three 250-character evidence blocks fit inside the 750-char budget:
-# 250 + "\n\n" + 250 + "\n\n" + 250 = 754 chars.  Snapped to word boundaries
-# to prevent broken letter artifacts.  3-source coverage means the correct
-# passage reaches the generator even when 1–2 top-ranked parents are noise.
-PER_CHUNK_CHARS = 250
-
-# 40 tokens gives headroom for longer answer entities like
-# "प्रशांत महासागर", "1947 ஆகஸ்ட் 15", "கார்பன் டை ஆக்சைடு"
-MAX_NEW_TOKENS = 40
-
+MAX_NEW_TOKENS = 24
 
 
 # =============================================================================
 # TEXT HELPERS
 # =============================================================================
 
-def word_splitter(text):
+def word_splitter(
+    text,
+):
 
-    text = str(text).casefold()
+    text = str(
+        text
+    ).casefold()
 
     tokens = []
     current = []
@@ -221,7 +239,9 @@ def word_splitter(text):
     for char in text:
 
         category = (
-            unicodedata.category(char)
+            unicodedata.category(
+                char
+            )
         )
 
         major = (
@@ -230,14 +250,22 @@ def word_splitter(text):
             else ""
         )
 
-        if major in {"L", "M", "N"}:
+        if major in {
+            "L",
+            "M",
+            "N",
+        }:
 
-            current.append(char)
+            current.append(
+                char
+            )
 
         elif current:
 
             tokens.append(
-                "".join(current)
+                "".join(
+                    current
+                )
             )
 
             current = []
@@ -245,7 +273,9 @@ def word_splitter(text):
     if current:
 
         tokens.append(
-            "".join(current)
+            "".join(
+                current
+            )
         )
 
     return tokens
@@ -271,7 +301,9 @@ class BM25Engine:
         ]
 
         schema = (
-            pq.read_schema(path)
+            pq.read_schema(
+                path
+            )
             .names
         )
 
@@ -300,27 +332,34 @@ class BM25Engine:
         ]
 
         has_chunk_id = (
-            "chunk_id" in schema
+            "chunk_id"
+            in schema
         )
 
         if has_chunk_id:
+
             read_columns.append(
                 "chunk_id"
             )
 
         df = pd.read_parquet(
             path,
-            columns=read_columns,
+            columns=
+                read_columns,
         )
 
         self.parent_ids = (
-            df["parent_id"]
+            df[
+                "parent_id"
+            ]
             .astype(str)
             .tolist()
         )
 
         self.chunk_texts = (
-            df[text_col]
+            df[
+                text_col
+            ]
             .fillna("")
             .astype(str)
             .tolist()
@@ -329,7 +368,9 @@ class BM25Engine:
         if has_chunk_id:
 
             self.chunk_ids = (
-                df["chunk_id"]
+                df[
+                    "chunk_id"
+                ]
                 .astype(str)
                 .tolist()
             )
@@ -338,41 +379,52 @@ class BM25Engine:
 
             self.chunk_ids = [
                 f"{language}_row_{i}"
-                for i in range(
+                for i
+                in range(
                     len(df)
                 )
             ]
 
-        texts = self.chunk_texts
-
-        self.tokenizer = Tokenizer(
-            stemmer=None,
-            stopwords=[],
-            splitter=
-                word_splitter,
+        self.tokenizer = (
+            Tokenizer(
+                stemmer=None,
+                stopwords=[],
+                splitter=
+                    word_splitter,
+            )
         )
 
         print(
             f"Building "
-            f"{language.upper()} BM25..."
+            f"{language.upper()} "
+            f"BM25 over "
+            f"{len(self.chunk_texts):,} chunks..."
         )
 
         corpus_tokens = (
-            self.tokenizer.tokenize(
-                texts,
-                return_as="tuple",
+            self.tokenizer
+            .tokenize(
+                self.chunk_texts,
+                return_as=
+                    "tuple",
             )
         )
 
-        self.retriever = bm25s.BM25(
-            k1=
-                cfg["bm25_k1"],
+        self.retriever = (
+            bm25s.BM25(
+                k1=
+                    cfg[
+                        "bm25_k1"
+                    ],
 
-            b=
-                cfg["bm25_b"],
+                b=
+                    cfg[
+                        "bm25_b"
+                    ],
 
-            method=
-                "lucene",
+                method=
+                    "lucene",
+            )
         )
 
         self.retriever.index(
@@ -381,7 +433,9 @@ class BM25Engine:
         )
 
         self.chunk_count = (
-            len(texts)
+            len(
+                self.chunk_texts
+            )
         )
 
 
@@ -395,15 +449,18 @@ class BM25Engine:
         )
 
         tokens = (
-            self.tokenizer.tokenize(
+            self.tokenizer
+            .tokenize(
                 [query],
                 update_vocab=False,
-                return_as="tuple",
+                return_as=
+                    "tuple",
             )
         )
 
         indices, scores = (
-            self.retriever.retrieve(
+            self.retriever
+            .retrieve(
                 tokens,
 
                 k=min(
@@ -422,22 +479,33 @@ class BM25Engine:
             scores[0],
         ):
 
-            score = float(score)
+            score = float(
+                score
+            )
 
             if score <= 0:
                 continue
 
-            idx = int(chunk_index)
+            idx = int(
+                chunk_index
+            )
 
             parent_id = (
-                self.parent_ids[idx]
+                self.parent_ids[
+                    idx
+                ]
             )
 
             if parent_id in seen:
                 continue
 
-            seen.add(parent_id)
-            parents.append(parent_id)
+            seen.add(
+                parent_id
+            )
+
+            parents.append(
+                parent_id
+            )
 
             evidence[
                 parent_id
@@ -446,10 +514,14 @@ class BM25Engine:
                     parent_id,
 
                 "chunk_id":
-                    self.chunk_ids[idx],
+                    self.chunk_ids[
+                        idx
+                    ],
 
                 "text":
-                    self.chunk_texts[idx],
+                    self.chunk_texts[
+                        idx
+                    ],
 
                 "score":
                     score,
@@ -458,7 +530,9 @@ class BM25Engine:
                     "bm25",
 
                 "rank":
-                    len(parents),
+                    len(
+                        parents
+                    ),
             }
 
             if (
@@ -489,21 +563,25 @@ class BM25Engine:
         self,
         query,
     ):
-        """Compatibility wrapper — returns (parents, elapsed_ms)."""
 
         (
             parents,
             elapsed_ms,
             _,
-        ) = self.search_with_evidence(
-            query
+        ) = (
+            self.search_with_evidence(
+                query
+            )
         )
 
-        return parents, elapsed_ms
+        return (
+            parents,
+            elapsed_ms,
+        )
 
 
 # =============================================================================
-# RRF
+# WEIGHTED RRF — FROZEN
 # =============================================================================
 
 def weighted_rrf(
@@ -519,26 +597,34 @@ def weighted_rrf(
     scores = {}
 
     for rank0, parent in enumerate(
-        dense[:FUSION_DEPTH]
+        dense[
+            :FUSION_DEPTH
+        ]
     ):
 
         contribution = (
             1.0
             /
             (
-                cfg["rrf_k"]
+                cfg[
+                    "rrf_k"
+                ]
                 +
                 (
                     rank0 + 1
                 )
                 /
-                cfg["dense_weight"]
+                cfg[
+                    "dense_weight"
+                ]
                 -
                 1
             )
         )
 
-        scores[parent] = (
+        scores[
+            parent
+        ] = (
             scores.get(
                 parent,
                 0.0,
@@ -548,26 +634,34 @@ def weighted_rrf(
         )
 
     for rank0, parent in enumerate(
-        sparse[:FUSION_DEPTH]
+        sparse[
+            :FUSION_DEPTH
+        ]
     ):
 
         contribution = (
             1.0
             /
             (
-                cfg["rrf_k"]
+                cfg[
+                    "rrf_k"
+                ]
                 +
                 (
                     rank0 + 1
                 )
                 /
-                cfg["sparse_weight"]
+                cfg[
+                    "sparse_weight"
+                ]
                 -
                 1
             )
         )
 
-        scores[parent] = (
+        scores[
+            parent
+        ] = (
             scores.get(
                 parent,
                 0.0,
@@ -581,15 +675,177 @@ def weighted_rrf(
         for parent, _
         in sorted(
             scores.items(),
-            key=lambda x:
-                (-x[1], x[0]),
-        )[:FINAL_PARENT_K]
+            key=lambda item:
+                (
+                    -item[1],
+                    item[0],
+                ),
+        )[
+            :FINAL_PARENT_K
+        ]
     ]
 
 
 # =============================================================================
-# CONTEXTTT
+# EVIDENCE WINDOW
 # =============================================================================
+
+def _query_centered_crop(
+    text: str,
+    query: str,
+    max_chars: int,
+) -> str:
+
+    text = " ".join(
+        str(
+            text
+        ).split()
+    )
+
+    if len(text) <= max_chars:
+        return text
+
+    query_terms = [
+        term
+        for term
+        in word_splitter(
+            query
+        )
+        if len(term) >= 2
+    ]
+
+    if not query_terms:
+        return (
+            text[
+                :max_chars
+            ]
+            .rsplit(
+                " ",
+                1,
+            )[0]
+            .strip()
+        )
+
+    folded = (
+        text.casefold()
+    )
+
+    positions = []
+
+    for term in query_terms:
+
+        pos = (
+            folded.find(
+                term.casefold()
+            )
+        )
+
+        if pos >= 0:
+            positions.append(
+                pos
+            )
+
+    if not positions:
+
+        result = text[
+            :max_chars
+        ]
+
+        if (
+            len(result)
+            <
+            len(text)
+            and
+            " " in result
+        ):
+            result = (
+                result
+                .rsplit(
+                    " ",
+                    1,
+                )[0]
+            )
+
+        return result.strip()
+
+    center = int(
+        sum(
+            positions
+        )
+        /
+        len(
+            positions
+        )
+    )
+
+    start = max(
+        0,
+        center
+        -
+        max_chars
+        //
+        3,
+    )
+
+    end = min(
+        len(text),
+        start
+        +
+        max_chars,
+    )
+
+    if (
+        end
+        -
+        start
+        <
+        max_chars
+    ):
+
+        start = max(
+            0,
+            end
+            -
+            max_chars,
+        )
+
+    if start > 0:
+
+        first_space = (
+            text.find(
+                " ",
+                start,
+            )
+        )
+
+        if (
+            first_space >= 0
+            and
+            first_space < end
+        ):
+            start = (
+                first_space + 1
+            )
+
+    if end < len(text):
+
+        last_space = (
+            text.rfind(
+                " ",
+                start,
+                end,
+            )
+        )
+
+        if last_space > start:
+            end = last_space
+
+    return (
+        text[
+            start:end
+        ]
+        .strip()
+    )
 
 
 def evidence_window(
@@ -598,106 +854,247 @@ def evidence_window(
     max_chars: int,
     language: str = "ta",
 ) -> str:
-    """Return the highest-scoring complete sentence(s) fitting inside max_chars.
-
-    Prioritizes complete informative sentences. Falls back to query-centered
-    word-boundary snapping if no individual sentence carries positive score.
     """
-    text = " ".join(str(text).split())
-    if len(text) <= max_chars:
-        return text
+    Produce one compact answer-focused evidence window.
 
-    sentences = split_sentences(text)
-    if sentences:
-        scored = []
-        for idx, s in enumerate(sentences):
-            sc = score_sentence(query, s, language)
-            scored.append((sc, idx, s))
-        scored.sort(key=lambda x: -x[0])
-        best_sc, best_idx, best_sent = scored[0]
+    Important fixes:
+    - NEVER bypass sentence scoring merely because a chunk is short.
+    - numbered lists are split into logical items.
+    - strong direct evidence returns ONLY the direct sentence.
+    - weak/list evidence may include one useful adjacent unit.
+    """
 
-        if best_sc > 0.0 and len(best_sent) <= max_chars:
-            result = best_sent
-            if best_idx + 1 < len(sentences):
-                cand = result + " " + sentences[best_idx + 1]
-                if len(cand) <= max_chars:
-                    result = cand
-            return result.strip()
+    text = str(
+        text
+    ).strip()
 
-    _FILLER_TERMS: set[str] = {
-        "எது", "என்ன", "எந்த", "எத்தனை", "யார்", "எங்கே",
-        "உள்ளது", "ஆகும்", "மிக", "மிகவும்", "ஒரே",
-        "क्या", "कौन", "कौनसा", "कहाँ", "कैसे",
-        "है", "हैं", "सबसे", "सबसेबड़ा", "सबसेछोटा",
-        "सबसेलंबा", "सबसेतेज", "सबसेलम्बी",
-    }
+    if not text:
+        return ""
 
-    query_terms = [
-        term
-        for term in word_splitter(query)
-        if len(term) >= 2
+    sentences = split_sentences(
+        text
+    )
+
+    if not sentences:
+        return _query_centered_crop(
+            text,
+            query,
+            max_chars,
+        )
+
+    # ---------------------------------------------------------
+    # Strong direct support:
+    # give the tiny model only the direct sentence.
+    # ---------------------------------------------------------
+
+    support = (
+        strongest_supporting_sentence(
+            query,
+            text,
+            language,
+        )
+    )
+
+    if (
+        support.strong
+        and
+        support.sentence
+    ):
+
+        if (
+            len(
+                support.sentence
+            )
+            <=
+            max_chars
+        ):
+            return (
+                support.sentence
+                .strip()
+            )
+
+        return _query_centered_crop(
+            support.sentence,
+            query,
+            max_chars,
+        )
+
+    # ---------------------------------------------------------
+    # Otherwise choose the best sentence/list item.
+    # ---------------------------------------------------------
+
+    scored = [
+        (
+            score_sentence(
+                query,
+                sentence,
+                language,
+            ),
+            idx,
+            sentence,
+        )
+        for idx, sentence
+        in enumerate(
+            sentences
+        )
     ]
 
-    term_weights = {
-        term: (0.2 if term.casefold() in _FILLER_TERMS else 1.0)
-        for term in query_terms
-    }
+    scored.sort(
+        key=lambda item:
+            (
+                -item[0],
+                item[1],
+            )
+    )
 
-    def _snap_to_words(raw_start: int, raw_end: int) -> str:
-        if raw_start > 0:
-            space_after = text.find(" ", raw_start)
-            start = (space_after + 1) if (space_after != -1 and space_after < raw_end) else raw_start
-        else:
-            start = 0
+    (
+        best_score,
+        best_idx,
+        best_sentence,
+    ) = scored[0]
 
-        if raw_end < len(text):
-            space_before = text.rfind(" ", start, raw_end)
-            end = space_before if (space_before > start) else raw_end
-        else:
-            end = len(text)
+    if best_score <= 0:
 
-        return text[start:end].strip()
-
-    if not query_terms:
-        return _snap_to_words(0, max_chars)
-
-    folded = text.casefold()
-    positions = []
-    for term in query_terms:
-        pos = folded.find(term.casefold())
-        if pos >= 0:
-            positions.append(pos)
-
-    if not positions:
-        return _snap_to_words(0, max_chars)
-
-    best_window = None
-    best_score = -1.0
-
-    for position in positions:
-        raw_start = max(0, position - max_chars // 3)
-        raw_end = min(len(text), raw_start + max_chars)
-        window = _snap_to_words(raw_start, raw_end)
-        window_terms = set(word_splitter(window))
-        score = sum(
-            weight
-            for term, weight in term_weights.items()
-            if term.casefold() in {t.casefold() for t in window_terms}
+        # No useful lexical alignment.
+        # Keep the passage compact rather than flooding the model.
+        return _query_centered_crop(
+            text,
+            query,
+            max_chars,
         )
-        if score > best_score:
-            best_score = score
-            best_window = window
 
-    if not best_window:
-        return _snap_to_words(0, max_chars)
+    if (
+        len(best_sentence)
+        >
+        max_chars
+    ):
 
-    return best_window.strip()
+        return _query_centered_crop(
+            best_sentence,
+            query,
+            max_chars,
+        )
+
+    result_parts = [
+        best_sentence
+    ]
+
+    remaining = (
+        max_chars
+        -
+        len(
+            best_sentence
+        )
+    )
+
+    # ---------------------------------------------------------
+    # Adjacent evidence is useful for cases such as:
+    #
+    # 3. Earth ...
+    # 4. It has one natural moon.
+    #
+    # We prefer NEXT before PREVIOUS.
+    # ---------------------------------------------------------
+
+    neighbor_indices = []
+
+    if (
+        best_idx + 1
+        <
+        len(sentences)
+    ):
+        neighbor_indices.append(
+            best_idx + 1
+        )
+
+    if best_idx > 0:
+        neighbor_indices.append(
+            best_idx - 1
+        )
+
+    for neighbor_idx in neighbor_indices:
+
+        neighbor = (
+            sentences[
+                neighbor_idx
+            ]
+        )
+
+        neighbor_cost = (
+            1
+            +
+            len(
+                neighbor
+            )
+        )
+
+        if neighbor_cost > remaining:
+            continue
+
+        neighbor_score = (
+            score_sentence(
+                query,
+                neighbor,
+                language,
+            )
+        )
+
+        # Add an adjacent unit only if:
+        # - it has some relevance, OR
+        # - we're dealing with list-style evidence where relation
+        #   can be split across adjacent items.
+        if (
+            neighbor_score > 0
+            or
+            neighbor.lstrip()[
+                :2
+            ].rstrip(".")
+            .isdigit()
+        ):
+
+            if (
+                neighbor_idx
+                <
+                best_idx
+            ):
+
+                result_parts.insert(
+                    0,
+                    neighbor,
+                )
+
+            else:
+
+                result_parts.append(
+                    neighbor
+                )
+
+            break
+
+    result = " ".join(
+        result_parts
+    )
+
+    if len(result) > max_chars:
+
+        result = _query_centered_crop(
+            result,
+            query,
+            max_chars,
+        )
+
+    return result.strip()
 
 
+# =============================================================================
+# CONTEXT STORE
+# =============================================================================
 
 class ContextStore:
 
-    def __init__(self):
+    def __init__(
+        self,
+    ):
 
         self.data = {}
         self.chunk_lookup = {}
@@ -707,7 +1104,9 @@ class ContextStore:
         ):
 
             schema = (
-                pq.read_schema(path)
+                pq.read_schema(
+                    path
+                )
                 .names
             )
 
@@ -721,11 +1120,21 @@ class ContextStore:
 
                 if candidate in schema:
 
-                    text_col = candidate
+                    text_col = (
+                        candidate
+                    )
+
                     break
 
+            if text_col is None:
+
+                raise RuntimeError(
+                    f"No text column in {path}"
+                )
+
             has_chunk_id = (
-                "chunk_id" in schema
+                "chunk_id"
+                in schema
             )
 
             read_columns = [
@@ -734,29 +1143,71 @@ class ContextStore:
             ]
 
             if has_chunk_id:
+
                 read_columns.append(
                     "chunk_id"
                 )
 
             df = pd.read_parquet(
                 path,
-                columns=read_columns,
+                columns=
+                    read_columns,
             )
+
+            parents = (
+                df[
+                    "parent_id"
+                ]
+                .astype(str)
+                .tolist()
+            )
+
+            texts = (
+                df[
+                    text_col
+                ]
+                .fillna("")
+                .astype(str)
+                .tolist()
+            )
+
+            if has_chunk_id:
+
+                chunk_ids = (
+                    df[
+                        "chunk_id"
+                    ]
+                    .astype(str)
+                    .tolist()
+                )
+
+            else:
+
+                chunk_ids = [
+                    None
+                    for _
+                    in range(
+                        len(df)
+                    )
+                ]
 
             mapping = {}
             chunk_mapping = {}
 
-            for row_index, row in (
-                df.iterrows()
+            # Faster than iterrows() for ~500k chunks.
+            for (
+                parent,
+                text,
+                chunk_id,
+            ) in zip(
+                parents,
+                texts,
+                chunk_ids,
             ):
 
-                parent = str(
-                    row["parent_id"]
+                text = (
+                    text.strip()
                 )
-
-                text = str(
-                    row[text_col]
-                ).strip()
 
                 if not text:
                     continue
@@ -764,13 +1215,11 @@ class ContextStore:
                 mapping.setdefault(
                     parent,
                     [],
-                ).append(text)
+                ).append(
+                    text
+                )
 
-                if has_chunk_id:
-
-                    chunk_id = str(
-                        row["chunk_id"]
-                    )
+                if chunk_id:
 
                     chunk_mapping[
                         chunk_id
@@ -782,7 +1231,9 @@ class ContextStore:
 
             self.chunk_lookup[
                 language
-            ] = chunk_mapping
+            ] = (
+                chunk_mapping
+            )
 
 
     def build(
@@ -801,30 +1252,80 @@ class ContextStore:
         )
 
         evidence_by_parent = (
-            evidence_by_parent or {}
+            evidence_by_parent
+            or {}
         )
 
         query_tokens = set(
-            word_splitter(query)
+            word_splitter(
+                query
+            )
         )
 
-        # --------------------------------------------------------------
-        # Rerank only the frozen fused candidates for context packing.
-        # Exact query coverage is a low-cost tie-breaker that helps BM25
-        # evidence containing the named entity/fact reach the two-slot
-        # prompt. Original fused order remains the deterministic fallback.
-        # --------------------------------------------------------------
-
         original_rank = {
-            str(parent): rank
-            for rank, parent in enumerate(
+            str(
+                parent
+            ):
+                rank
+
+            for rank, parent
+            in enumerate(
                 parents
             )
         }
 
-        def evidence_texts(parent):
-            evidence = evidence_by_parent.get(
-                str(parent)
+
+        def resolve_candidate_text(
+            candidate,
+        ):
+
+            if not candidate:
+                return None
+
+            text = (
+                candidate.get(
+                    "text"
+                )
+            )
+
+            if text:
+                return str(
+                    text
+                )
+
+            chunk_id = (
+                candidate.get(
+                    "chunk_id"
+                )
+            )
+
+            if chunk_id:
+
+                return (
+                    self.chunk_lookup[
+                        language
+                    ]
+                    .get(
+                        str(
+                            chunk_id
+                        )
+                    )
+                )
+
+            return None
+
+
+        def evidence_texts(
+            parent,
+        ):
+
+            evidence = (
+                evidence_by_parent
+                .get(
+                    str(
+                        parent
+                    )
+                )
             )
 
             if not evidence:
@@ -834,52 +1335,74 @@ class ContextStore:
 
             for candidate in (
                 evidence,
-                evidence.get("alternate"),
+                evidence.get(
+                    "alternate"
+                ),
             ):
-                if not candidate:
-                    continue
 
-                text = candidate.get("text")
-                chunk_id = candidate.get(
-                    "chunk_id"
+                text = (
+                    resolve_candidate_text(
+                        candidate
+                    )
                 )
 
-                if not text and chunk_id:
-                    text = self.chunk_lookup[
-                        language
-                    ].get(str(chunk_id))
-
                 if text:
-                    texts.append(str(text))
+                    texts.append(
+                        text
+                    )
 
             return texts
 
+
+        # ==============================================================
+        # CONTEXT-PACK RERANK ONLY.
+        #
+        # The frozen fused parent ranking is NOT changed.
+        #
+        # We simply choose which already-retrieved parents deserve the
+        # tiny two-slot generation context.
+        # ==============================================================
+
         parents = sorted(
             (
-                str(parent)
-                for parent in parents
+                str(
+                    parent
+                )
+                for parent
+                in parents
             ),
+
             key=lambda parent: (
                 -max(
                     (
-                        evidence_relevance_score(
+                        evidence_pack_score(
                             query,
                             text,
                             language,
                         )
-                        for text in evidence_texts(
+
+                        for text
+                        in evidence_texts(
                             parent
                         )
                     ),
-                    default=0.0,
+
+                    default=
+                        0.0,
                 ),
-                original_rank[parent],
+
+                original_rank[
+                    parent
+                ],
             ),
         )
 
+
         blocks = []
-        used = 0
+        used_chars = 0
         used_evidence = []
+        support_signals = []
+
 
         for parent in parents:
 
@@ -890,118 +1413,141 @@ class ContextStore:
             ):
                 break
 
+
             selected_text = None
             selected_chunk_id = None
             selected_lane = "fallback"
             selected_score = None
 
-            # ----------------------------------------------------------
-            # Prefer the actual child that caused retrieval.
-            # ----------------------------------------------------------
 
-            evidence = evidence_by_parent.get(
-                str(parent)
+            evidence = (
+                evidence_by_parent
+                .get(
+                    str(
+                        parent
+                    )
+                )
             )
+
+
+            # ==========================================================
+            # Preferred retrieved child
+            # ==========================================================
 
             if evidence:
 
                 selected_chunk_id = (
-                    evidence.get("chunk_id")
+                    evidence.get(
+                        "chunk_id"
+                    )
                 )
 
                 selected_lane = (
-                    evidence.get("lane", "unknown")
+                    evidence.get(
+                        "lane",
+                        "unknown",
+                    )
                 )
 
                 selected_score = (
-                    evidence.get("score")
+                    evidence.get(
+                        "score"
+                    )
                 )
 
-                # BM25 already carries the actual child text.
-                if evidence.get("text"):
-                    selected_text = evidence["text"]
-
-                # Dense result: resolve chunk_id -> text.
-                elif selected_chunk_id:
-                    selected_text = (
-                        self.chunk_lookup[
-                            language
-                        ].get(
-                            str(selected_chunk_id)
-                        )
+                selected_text = (
+                    resolve_candidate_text(
+                        evidence
                     )
+                )
 
-            # ----------------------------------------------------------
-            # Compare the preferred and alternate retrieved children.
-            # The higher query-coverage child is more useful to the small
-            # generator. This changes neither parent fusion nor retrieval.
-            # ----------------------------------------------------------
+
+            # ==========================================================
+            # Compare alternate dense/BM25 child.
+            #
+            # Use answer-focused pack score instead of raw overlap.
+            # ==========================================================
 
             if evidence:
 
-                alternate = evidence.get(
-                    "alternate"
+                alternate = (
+                    evidence.get(
+                        "alternate"
+                    )
                 )
 
                 if alternate:
 
                     alt_text = (
-                        alternate.get("text")
-                    )
-
-                    alt_chunk_id = (
-                        alternate.get("chunk_id")
-                    )
-
-                    # Dense alternate resolves via chunk_lookup.
-                    if not alt_text and alt_chunk_id:
-                        alt_text = (
-                            self.chunk_lookup[
-                                language
-                            ].get(
-                                str(alt_chunk_id)
-                            )
+                        resolve_candidate_text(
+                            alternate
                         )
+                    )
 
-                    if (
-                        alt_text
-                        and (
-                            not selected_text
-                            or evidence_relevance_score(
-                                query,
-                                alt_text,
-                                language,
-                            )
-                            > evidence_relevance_score(
+                    if alt_text:
+
+                        selected_pack_score = (
+                            evidence_pack_score(
                                 query,
                                 selected_text,
                                 language,
                             )
-                        )
-                    ):
-                        selected_text = alt_text
-                        selected_chunk_id = alt_chunk_id
-                        selected_lane = (
-                            alternate.get(
-                                "lane",
-                                "alternate",
-                            )
-                        )
-                        selected_score = (
-                            alternate.get("score")
+                            if selected_text
+                            else 0.0
                         )
 
-            # ----------------------------------------------------------
-            # Compatibility fallback: lexical selection inside parent.
-            # ----------------------------------------------------------
+                        alternate_pack_score = (
+                            evidence_pack_score(
+                                query,
+                                alt_text,
+                                language,
+                            )
+                        )
+
+                        if (
+                            alternate_pack_score
+                            >
+                            selected_pack_score
+                        ):
+
+                            selected_text = (
+                                alt_text
+                            )
+
+                            selected_chunk_id = (
+                                alternate.get(
+                                    "chunk_id"
+                                )
+                            )
+
+                            selected_lane = (
+                                alternate.get(
+                                    "lane",
+                                    "alternate",
+                                )
+                            )
+
+                            selected_score = (
+                                alternate.get(
+                                    "score"
+                                )
+                            )
+
+
+            # ==========================================================
+            # Parent-level compatibility fallback
+            # ==========================================================
 
             if not selected_text:
 
                 candidates = (
                     self.data[
                         language
-                    ].get(
-                        str(parent),
+                    ]
+                    .get(
+                        str(
+                            parent
+                        ),
                         [],
                     )
                 )
@@ -1012,52 +1558,91 @@ class ContextStore:
                 selected_text = max(
                     candidates,
 
-                    key=lambda t: len(
-                        query_tokens
-                        &
-                        set(word_splitter(t))
-                    ),
+                    key=lambda candidate_text:
+                        (
+                            evidence_pack_score(
+                                query,
+                                candidate_text,
+                                language,
+                            ),
+
+                            len(
+                                query_tokens
+                                &
+                                set(
+                                    word_splitter(
+                                        candidate_text
+                                    )
+                                )
+                            ),
+                        ),
                 )
 
-                selected_lane = "fallback"
+                selected_lane = (
+                    "fallback"
+                )
 
-            # ----------------------------------------------------------
-            # Select a query-centred evidence window instead of blindly
-            # truncating the beginning of the chunk.
-            # ----------------------------------------------------------
 
-            snippet = evidence_window(
-                selected_text,
-                query,
-                per_chunk_chars,
-                language=language,
+            snippet = (
+                evidence_window(
+                    selected_text,
+                    query,
+                    per_chunk_chars,
+                    language=
+                        language,
+                )
             )
 
-            # Source numbers remain in used_evidence/UI metadata. Do not put
-            # them in the generator prompt: the small model can mistake the
-            # label itself for the requested shortest answer span.
-            block = snippet
+            if not snippet:
+                continue
+
+
+            # ==========================================================
+            # Correct character-budget accounting.
+            #
+            # Previous version effectively charged "+2" after inserting
+            # the first block but did not include that separator in the
+            # actual pre-check.
+            # ==============================================================
+
+            separator_cost = (
+                2
+                if blocks
+                else 0
+            )
+
+            candidate_cost = (
+                separator_cost
+                +
+                len(
+                    snippet
+                )
+            )
 
             if (
-                used
+                used_chars
                 +
-                len(block)
+                candidate_cost
                 >
                 char_budget
             ):
-                # Use continue (not break) so a shorter later snippet
-                # can still fill the remaining budget.
                 continue
 
-            blocks.append(block)
 
-            used += (
-                len(block) + 2
+            blocks.append(
+                snippet
             )
 
-            used_evidence.append({
+            used_chars += (
+                candidate_cost
+            )
+
+
+            source = {
                 "parent_id":
-                    str(parent),
+                    str(
+                        parent
+                    ),
 
                 "chunk_id":
                     selected_chunk_id,
@@ -1070,22 +1655,127 @@ class ContextStore:
 
                 "text":
                     snippet,
-            })
+            }
 
-        context = (
-            "\n\n".join(blocks)
-        )
+            used_evidence.append(
+                source
+            )
+
+            support_signals.append(
+                strongest_supporting_sentence(
+                    query,
+                    snippet,
+                    language,
+                )
+            )
+
+
+        # ==============================================================
+        # STRONG SUPPORT COLLAPSE
+        #
+        # This is the most important tiny-model optimization.
+        #
+        # If ONE sentence strongly answers the query:
+        #
+        #     Question
+        #       ↓
+        #     exactly one strong sentence
+        #       ↓
+        #     0.6B extractor
+        #
+        # rather than feeding an unrelated second source.
+        #
+        # No LLM call. No retrieval changes.
+        # ==============================================================
+
+        strong_indices = [
+            idx
+            for idx, signal
+            in enumerate(
+                support_signals
+            )
+            if signal.strong
+        ]
+
+        if strong_indices:
+
+            best_idx = max(
+                strong_indices,
+
+                key=lambda idx: (
+                    support_signals[
+                        idx
+                    ].score,
+
+                    support_signals[
+                        idx
+                    ].coverage,
+
+                    support_signals[
+                        idx
+                    ].matched_terms,
+
+                    -idx,
+                ),
+            )
+
+            signal = (
+                support_signals[
+                    best_idx
+                ]
+            )
+
+            focused_source = dict(
+                used_evidence[
+                    best_idx
+                ]
+            )
+
+            focused_source[
+                "text"
+            ] = (
+                signal.sentence
+            )
+
+            context = (
+                signal.sentence
+            )
+
+            used_evidence = [
+                focused_source
+            ]
+
+            context_parent_count = 1
+
+        else:
+
+            context = (
+                "\n\n".join(
+                    blocks
+                )
+            )
+
+            context_parent_count = (
+                len(
+                    blocks
+                )
+            )
+
 
         ms = (
-            time.perf_counter()
-            -
-            start
-        ) * 1000
+            (
+                time.perf_counter()
+                -
+                start
+            )
+            *
+            1000
+        )
 
         return (
             context,
             ms,
-            len(blocks),
+            context_parent_count,
             used_evidence,
         )
 
@@ -1103,7 +1793,9 @@ class FirstTokenStreamer(
         tokenizer,
     ):
 
-        self.tokenizer = tokenizer
+        self.tokenizer = (
+            tokenizer
+        )
 
         self.ignore_prompt = True
 
@@ -1130,14 +1822,19 @@ class FirstTokenStreamer(
             .tolist()
         )
 
-        # generate() sends the prompt
-        # through streamer first.
+        # generate() sends prompt through streamer first.
         if self.ignore_prompt:
 
-            self.ignore_prompt = False
+            self.ignore_prompt = (
+                False
+            )
+
             return
 
-        if self.first_token_at is None:
+        if (
+            self.first_token_at
+            is None
+        ):
 
             self.first_token_at = (
                 time.perf_counter()
@@ -1148,7 +1845,9 @@ class FirstTokenStreamer(
         )
 
 
-    def end(self):
+    def end(
+        self,
+    ):
 
         self.completed_at = (
             time.perf_counter()
@@ -1163,24 +1862,28 @@ class FirstTokenStreamer(
 
 class FullRAG:
 
-    def __init__(self):
+    def __init__(
+        self,
+    ):
 
         # ---------------------------------------------------------
         # QDRANT
         # ---------------------------------------------------------
 
-        self.qdrant = QdrantClient(
-            url=
-                settings.qdrant_url,
+        self.qdrant = (
+            QdrantClient(
+                url=
+                    settings.qdrant_url,
 
-            prefer_grpc=
-                settings.qdrant_prefer_grpc,
+                prefer_grpc=
+                    settings.qdrant_prefer_grpc,
 
-            timeout=
-                30,
+                timeout=
+                    30,
 
-            check_compatibility=
-                False,
+                check_compatibility=
+                    False,
+            )
         )
 
 
@@ -1231,9 +1934,6 @@ class FullRAG:
             )
         )
 
-        # generate() budgets evidence so the final prompt fits. Right-side
-        # truncation remains an additional safety net for unexpected template
-        # overhead; the explicit budget normally prevents it from activating.
         self.gen_tokenizer.truncation_side = (
             "right"
         )
@@ -1255,22 +1955,46 @@ class FullRAG:
 
 
         # ---------------------------------------------------------
+        # PRE-COMPUTE SENTINEL TOKENIZATION
+        # ---------------------------------------------------------
+
+        self.not_found_token_ids = (
+            self.gen_tokenizer.encode(
+                "NOT_FOUND",
+                add_special_tokens=False,
+            )
+        )
+
+
+        # ---------------------------------------------------------
         # BM25
         # ---------------------------------------------------------
 
         self.bm25 = {
             "ta":
-                BM25Engine("ta"),
+                BM25Engine(
+                    "ta"
+                ),
 
             "hi":
-                BM25Engine("hi"),
+                BM25Engine(
+                    "hi"
+                ),
         }
 
+
+        # ---------------------------------------------------------
+        # CONTEXT
+        # ---------------------------------------------------------
 
         self.contexts = (
             ContextStore()
         )
 
+
+        # ---------------------------------------------------------
+        # BM25 THREAD
+        # ---------------------------------------------------------
 
         self.executor = (
             ThreadPoolExecutor(
@@ -1281,13 +2005,17 @@ class FullRAG:
 
         print(
             "GPU:",
-            torch.cuda.get_device_name(0)
+            torch.cuda
+            .get_device_name(
+                0
+            )
         )
 
         print(
             "GPU allocated:",
             round(
-                torch.cuda.memory_allocated()
+                torch.cuda
+                .memory_allocated()
                 /
                 1024**3,
                 2,
@@ -1310,17 +2038,26 @@ class FullRAG:
             time.perf_counter()
         )
 
+
+        # ---------------------------------------------------------
+        # Start sparse retrieval concurrently.
+        # ---------------------------------------------------------
+
         sparse_future = (
             self.executor.submit(
                 self.bm25[
                     language
-                ].search_with_evidence,
+                ]
+                .search_with_evidence,
+
                 query,
             )
         )
 
 
-        # EMBEDDING
+        # ---------------------------------------------------------
+        # QUERY EMBEDDING
+        # ---------------------------------------------------------
 
         torch.cuda.synchronize()
 
@@ -1352,20 +2089,27 @@ class FullRAG:
         torch.cuda.synchronize()
 
         embed_ms = (
-            time.perf_counter()
-            -
-            embed_start
-        ) * 1000
+            (
+                time.perf_counter()
+                -
+                embed_start
+            )
+            *
+            1000
+        )
 
 
+        # ---------------------------------------------------------
         # DENSE
+        # ---------------------------------------------------------
 
         dense_start = (
             time.perf_counter()
         )
 
         response = (
-            self.qdrant.query_points(
+            self.qdrant
+            .query_points(
                 collection_name=
                     CFG[
                         language
@@ -1406,7 +2150,10 @@ class FullRAG:
         seen = set()
         dense_evidence = {}
 
-        for point in response.points:
+
+        for point in (
+            response.points
+        ):
 
             payload = (
                 point.payload
@@ -1427,8 +2174,13 @@ class FullRAG:
             ):
                 continue
 
-            seen.add(parent)
-            dense.append(parent)
+            seen.add(
+                parent
+            )
+
+            dense.append(
+                parent
+            )
 
             dense_evidence[
                 parent
@@ -1453,7 +2205,9 @@ class FullRAG:
                     "dense",
 
                 "rank":
-                    len(dense),
+                    len(
+                        dense
+                    ),
             }
 
             if (
@@ -1465,18 +2219,29 @@ class FullRAG:
 
 
         dense_ms = (
-            time.perf_counter()
-            -
-            dense_start
-        ) * 1000
+            (
+                time.perf_counter()
+                -
+                dense_start
+            )
+            *
+            1000
+        )
 
 
         (
             sparse,
             bm25_ms,
             sparse_evidence,
-        ) = sparse_future.result()
+        ) = (
+            sparse_future
+            .result()
+        )
 
+
+        # ---------------------------------------------------------
+        # FROZEN FUSION
+        # ---------------------------------------------------------
 
         fused = weighted_rrf(
             dense,
@@ -1485,105 +2250,176 @@ class FullRAG:
         )
 
 
-        # -----------------------------------------------------------------
-        # EVIDENCE SELECTION
+        # ---------------------------------------------------------
+        # EVIDENCE CHILD PRESERVATION
         #
-        # For each parent in the already-ranked fused list, pick the child
-        # (dense or BM25) whose RRF contribution was larger. This does not
-        # affect the fused ranking — it only determines which actual child
-        # text is forwarded to ContextStore.
-        # -----------------------------------------------------------------
+        # Parent ranking is unchanged.
+        # ---------------------------------------------------------
 
-        cfg = CFG[language]
+        cfg = CFG[
+            language
+        ]
 
         dense_rank = {
-            parent: rank
+            parent:
+                rank
+
             for rank, parent
-            in enumerate(dense, start=1)
+            in enumerate(
+                dense,
+                start=1,
+            )
         }
 
         sparse_rank = {
-            parent: rank
+            parent:
+                rank
+
             for rank, parent
-            in enumerate(sparse, start=1)
+            in enumerate(
+                sparse,
+                start=1,
+            )
         }
 
-        def _rrf_contribution(rank, weight):
+
+        def _rrf_contribution(
+            rank,
+            weight,
+        ):
+
             if rank is None:
                 return 0.0
+
             return (
                 1.0
                 /
                 (
-                    cfg["rrf_k"]
+                    cfg[
+                        "rrf_k"
+                    ]
                     +
-                    rank / weight
+                    rank
+                    /
+                    weight
                     -
                     1
                 )
             )
 
+
         evidence_by_parent = {}
+
 
         for parent in fused:
 
             dense_info = (
-                dense_evidence.get(parent)
+                dense_evidence.get(
+                    parent
+                )
             )
 
             sparse_info = (
-                sparse_evidence.get(parent)
+                sparse_evidence.get(
+                    parent
+                )
             )
 
-            dense_contrib = _rrf_contribution(
-                dense_rank.get(parent),
-                cfg["dense_weight"],
+            dense_contrib = (
+                _rrf_contribution(
+                    dense_rank.get(
+                        parent
+                    ),
+                    cfg[
+                        "dense_weight"
+                    ],
+                )
             )
 
-            sparse_contrib = _rrf_contribution(
-                sparse_rank.get(parent),
-                cfg["sparse_weight"],
+            sparse_contrib = (
+                _rrf_contribution(
+                    sparse_rank.get(
+                        parent
+                    ),
+                    cfg[
+                        "sparse_weight"
+                    ],
+                )
             )
+
 
             if (
                 dense_info
                 and
-                dense_contrib >= sparse_contrib
+                dense_contrib
+                >=
+                sparse_contrib
             ):
-                # Dense wins — keep sparse as alternate in case
-                # chunk_lookup can't resolve the dense chunk_id.
-                selected = dict(dense_info)
+
+                selected = dict(
+                    dense_info
+                )
+
                 if sparse_info:
-                    selected["alternate"] = sparse_info
-                evidence_by_parent[parent] = selected
+
+                    selected[
+                        "alternate"
+                    ] = (
+                        sparse_info
+                    )
+
+                evidence_by_parent[
+                    parent
+                ] = (
+                    selected
+                )
+
 
             elif sparse_info:
-                # Sparse wins — keep dense as alternate.
-                selected = dict(sparse_info)
+
+                selected = dict(
+                    sparse_info
+                )
+
                 if dense_info:
-                    selected["alternate"] = dense_info
-                evidence_by_parent[parent] = selected
+
+                    selected[
+                        "alternate"
+                    ] = (
+                        dense_info
+                    )
+
+                evidence_by_parent[
+                    parent
+                ] = (
+                    selected
+                )
+
 
             elif dense_info:
-                # Dense only, no sparse match.
-                evidence_by_parent[parent] = dict(
+
+                evidence_by_parent[
+                    parent
+                ] = dict(
                     dense_info
                 )
 
 
         retrieval_ms = (
-            time.perf_counter()
-            -
-            overall
-        ) * 1000
+            (
+                time.perf_counter()
+                -
+                overall
+            )
+            *
+            1000
+        )
 
 
         return {
             "parents":
                 fused,
 
-            # Exposed for the retrieval parity gate (dense + sparse + fused).
-            # Ignored by all production callers which read ["parents"] only.
             "dense_parents":
                 dense,
 
@@ -1607,7 +2443,6 @@ class FullRAG:
         }
 
 
-
     # =========================================================================
     # GENERATE
     # =========================================================================
@@ -1617,31 +2452,100 @@ class FullRAG:
         query,
         context,
         max_new_tokens,
+        language="ta",
     ):
 
         stage_start = (
             time.perf_counter()
         )
 
+
+        # ---------------------------------------------------------
+        # DETERMINE WHETHER THE EVIDENCE IS ALREADY STRONG.
+        #
+        # ContextStore usually collapses strong evidence to one sentence.
+        # We recompute here because it is extremely cheap and keeps the
+        # generator self-contained.
+        # ---------------------------------------------------------
+
+        support = (
+            strongest_supporting_sentence(
+                query,
+                context,
+                language,
+            )
+        )
+
+        strong_evidence = (
+            support.strong
+        )
+
+
+        # ---------------------------------------------------------
+        # TWO PROMPT MODES
+        #
+        # CRITICAL:
+        #
+        # Strong evidence:
+        #     DO NOT expose NOT_FOUND as the easy escape route.
+        #
+        # Weak evidence:
+        #     allow strict abstention.
+        #
+        # No second LLM call.
+        # ---------------------------------------------------------
+
+        if strong_evidence:
+
+            system_content = (
+                "You are a factual span extractor. "
+                "The Evidence contains the answer to the Question. "
+                "Return ONLY the shortest answer words or value that are "
+                "directly supported by the Evidence. "
+                "Keep the original language/script. "
+                "Do not explain. "
+                "Do not repeat the question. "
+                "Do not automatically choose the first item from a list."
+            )
+
+        else:
+
+            system_content = (
+                "You are a grounded factual extractor. "
+                "Use ONLY the Evidence. "
+                "If one evidence sentence directly answers the Question, "
+                "return ONLY the shortest supported answer words or value. "
+                "Otherwise output exactly NOT_FOUND. "
+                "Do not guess. "
+                "Do not use outside knowledge. "
+                "Do not automatically choose the first item from a list."
+            )
+
+
         messages = [
             {
-                "role": "system",
-                "content": (
-                    "You are a precise factual QA assistant. "
-                    "Extract and output ONLY the direct answer to the question using the provided context. "
-                    "Output just the factual name, entity, or number in the language of the question. "
-                    "If the context contains no answer, output NOT_FOUND."
-                ),
+                "role":
+                    "system",
+
+                "content":
+                    system_content,
             },
+
             {
-                "role": "user",
-                "content": (
-                    f"Context:\n{context}\n\n"
-                    f"Question:\n{query}\n\n"
-                    "Answer:"
-                ),
+                "role":
+                    "user",
+
+                "content":
+                    (
+                        f"Question:\n"
+                        f"{query}\n\n"
+                        f"Evidence:\n"
+                        f"{context}\n\n"
+                        f"Answer:"
+                    ),
             },
         ]
+
 
         prompt = (
             self.gen_tokenizer
@@ -1650,9 +2554,11 @@ class FullRAG:
 
                 tokenize=False,
 
-                add_generation_prompt=True,
+                add_generation_prompt=
+                    True,
 
-                enable_thinking=False,
+                enable_thinking=
+                    False,
             )
         )
 
@@ -1670,27 +2576,39 @@ class FullRAG:
                 max_length=
                     1024,
             )
-            .to("cuda")
+            .to(
+                "cuda"
+            )
         )
 
 
         prompt_tokens = int(
-            inputs["input_ids"].shape[1]
+            inputs[
+                "input_ids"
+            ]
+            .shape[
+                1
+            ]
         )
 
+
         if prompt_tokens >= 950:
+
             print(
-                f"⚠️ Prompt near truncation: "
+                "⚠️ Prompt near truncation: "
                 f"{prompt_tokens} tokens"
             )
 
 
-
         prep_ms = (
-            time.perf_counter()
-            -
-            stage_start
-        ) * 1000
+            (
+                time.perf_counter()
+                -
+                stage_start
+            )
+            *
+            1000
+        )
 
 
         streamer = (
@@ -1714,6 +2632,10 @@ class FullRAG:
 
             "use_cache":
                 True,
+
+            "pad_token_id":
+                self.gen_tokenizer
+                .eos_token_id,
         }
 
 
@@ -1724,15 +2646,18 @@ class FullRAG:
         )
 
 
-        worker = threading.Thread(
-            target=
-                self.generator.generate,
+        worker = (
+            threading.Thread(
+                target=
+                    self.generator
+                    .generate,
 
-            kwargs=
-                kwargs,
+                kwargs=
+                    kwargs,
 
-            daemon=
-                True,
+                daemon=
+                    True,
+            )
         )
 
         worker.start()
@@ -1756,7 +2681,8 @@ class FullRAG:
 
 
         raw_answer = (
-            self.gen_tokenizer.decode(
+            self.gen_tokenizer
+            .decode(
                 streamer.generated_ids,
 
                 skip_special_tokens=
@@ -1764,35 +2690,74 @@ class FullRAG:
             )
         )
 
+
         lines = [
             line.strip()
-            for line in raw_answer.strip().split("\n")
+
+            for line
+            in raw_answer
+            .strip()
+            .splitlines()
+
             if line.strip()
         ]
-        answer = lines[0] if lines else ""
 
+
+        answer = (
+            lines[0]
+            if lines
+            else ""
+        )
 
 
         first_token_ms = (
-            streamer.first_token_at
-            -
-            model_start
-        ) * 1000
+            (
+                streamer.first_token_at
+                -
+                model_start
+            )
+            *
+            1000
+        )
 
 
         complete_ms = (
-            streamer.completed_at
-            -
-            model_start
-        ) * 1000
+            (
+                streamer.completed_at
+                -
+                model_start
+            )
+            *
+            1000
+        )
 
 
         return {
             "answer":
                 answer.strip(),
 
+            "raw_answer":
+                raw_answer.strip(),
+
+            "strong_evidence":
+                strong_evidence,
+
+            "support_score":
+                support.score,
+
+            "support_coverage":
+                support.coverage,
+
+            "support_sentence":
+                support.sentence,
+
             "prompt_tokens":
                 prompt_tokens,
+
+            "prompt_context_chars":
+                len(
+                    context
+                ),
 
             "prompt_prep_ms":
                 prep_ms,
@@ -1816,39 +2781,96 @@ class FullRAG:
             "completed_at":
                 streamer.completed_at,
 
-            # Telemetry for truncation-rate benchmark.
-            # Correction 3: token-limit hit only — no EOS ID dependency.
             "generated_tokens":
-                len(streamer.generated_ids),
+                len(
+                    streamer.generated_ids
+                ),
 
             "possibly_truncated": (
-                len(streamer.generated_ids)
+                len(
+                    streamer.generated_ids
+                )
                 >=
                 max_new_tokens
             ),
         }
 
 
-    def warmup(self) -> None:
-        """Run startup warmup for Tamil and Hindi queries to pre-compile CUDA kernels."""
-        warmup_queries = [
-            ("இந்தியாவின் தலைநகரம் எது?", "ta"),
-            ("भारत की राजधानी क्या है?", "hi"),
-        ]
-        for q, lang in warmup_queries:
-            try:
-                ret = self.retrieve(q, lang)
-                ctx, _, _, _ = self.contexts.build(
-                    lang,
-                    q,
-                    ret["parents"],
-                    CONTEXT_CHAR_BUDGET,
-                    MAX_CONTEXT_PARENTS,
-                    PER_CHUNK_CHARS,
-                    evidence_by_parent=ret.get("evidence_by_parent", {}),
-                )
-                if ctx:
-                    self.generate(q, ctx, 16)
-            except Exception as exc:
-                print(f"Warmup warning for {lang}: {exc}")
+    # =========================================================================
+    # WARMUP
+    # =========================================================================
 
+    def warmup(
+        self,
+    ) -> None:
+
+        warmup_queries = [
+            (
+                "இந்தியாவின் தலைநகரம் எது?",
+                "ta",
+            ),
+            (
+                "भारत की राजधानी क्या है?",
+                "hi",
+            ),
+        ]
+
+
+        for query, language in (
+            warmup_queries
+        ):
+
+            try:
+
+                retrieval = (
+                    self.retrieve(
+                        query,
+                        language,
+                    )
+                )
+
+                (
+                    context,
+                    _,
+                    _,
+                    _,
+                ) = (
+                    self.contexts.build(
+                        language,
+                        query,
+
+                        retrieval[
+                            "parents"
+                        ],
+
+                        CONTEXT_CHAR_BUDGET,
+                        MAX_CONTEXT_PARENTS,
+                        PER_CHUNK_CHARS,
+
+                        evidence_by_parent=
+                            retrieval.get(
+                                "evidence_by_parent",
+                                {},
+                            ),
+                    )
+                )
+
+                if context:
+
+                    # IMPORTANT FIX:
+                    # Hindi warmup previously used default language="ta".
+                    self.generate(
+                        query,
+                        context,
+                        16,
+                        language=
+                            language,
+                    )
+
+            except Exception as exc:
+
+                print(
+                    f"Warmup warning "
+                    f"for {language}: "
+                    f"{exc}"
+                )

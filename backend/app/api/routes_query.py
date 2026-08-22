@@ -413,8 +413,10 @@ def query(
             payload.query,
             context,
             MAX_NEW_TOKENS,
+            language=payload.language,
         )
     )
+
 
 
     # =====================================================================
@@ -446,8 +448,15 @@ def query(
                     "possibly_truncated",
                     False,
                 ),
+
+            strong_evidence=
+                generation.get(
+                    "strong_evidence",
+                    False,
+                ),
         )
     )
+
 
 
     # =====================================================================

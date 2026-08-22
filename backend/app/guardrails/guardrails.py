@@ -1,61 +1,138 @@
 """
-Guardrails around the RAG engine — never inside it.
+Deterministic guardrails around GOAt AI RAG.
 
-Every function here wraps `app.rag.engine.FullRAG`'s inputs/outputs; none of
-them touch retrieval, fusion, context selection, or generation. Kept
-deliberately minimal and language-agnostic: the corpus and queries are
-Tamil/Hindi, so naive English keyword "off-topic" blocking would just reject
-legitimate questions. The strongest grounding signal this system has is
-structural, not a classifier: no retrieved context -> don't answer; model
-says NOT_FOUND -> say so gracefully.
+Objectives:
+- no extra LLM call,
+- preserve latency,
+- allow correct grounded short answers,
+- reject distractor-list hallucinations,
+- reject answers whose requested unit/modifier is unsupported,
+- preserve strict NOT_FOUND behavior when evidence is genuinely weak.
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
+
 from dataclasses import dataclass
 from typing import Optional
 
-SUPPORTED_LANGUAGES = {"ta", "hi"}
+from app.rag.evidence_quality import (
+    hard_constraints_satisfied,
+    informative_query_terms,
+    is_list_item,
+    query_overlap_stats,
+    split_sentences,
+    split_terms,
+    term_matches,
+)
+
+
+# =============================================================================
+# BASIC CONFIG
+# =============================================================================
+
+SUPPORTED_LANGUAGES = {
+    "ta",
+    "hi",
+}
 
 MAX_QUERY_CHARS = 500
-NOT_FOUND_SENTINEL = "NOT_FOUND"
 
-_CITATION_RE = re.compile(r"\[\s*\d+\s*\]")
+NOT_FOUND_SENTINEL = (
+    "NOT_FOUND"
+)
+
+
+NOT_FOUND_MESSAGE = {
+    "ta":
+        "இந்தக் கேள்விக்கான தகவல் எங்கள் தரவுத்தளத்தில் இல்லை.",
+
+    "hi":
+        "इस प्रश्न से जुड़ी जानकारी हमारे डेटा में उपलब्ध नहीं है।",
+}
+
+
+DEFAULT_NOT_FOUND_MESSAGE = (
+    "No grounded information was found for this query."
+)
+
+
+# =============================================================================
+# REGEX
+# =============================================================================
+
+_CITATION_RE = re.compile(
+    r"\[\s*\d+\s*\]"
+)
+
 _CITATION_ONLY_RE = re.compile(
     r"^(?:\s*\[\s*\d+\s*\]\s*)+$"
 )
+
 _TARGET_SCRIPT = {
-    "ta": re.compile(r"[\u0B80-\u0BFF]"),
-    "hi": re.compile(r"[\u0900-\u097F]"),
+    "ta":
+        re.compile(
+            r"[\u0B80-\u0BFF]"
+        ),
+
+    "hi":
+        re.compile(
+            r"[\u0900-\u097F]"
+        ),
 }
+
+
 _NUMERIC_ANSWER_RE = re.compile(
     r"^[\s\d.,:+\-−°%/]+"
-    r"(?:c|f|°c|°f|km|kg|m|cm|mm)?$",
+    r"(?:f|c|°c|°f|km|kg|m|cm|mm)?$",
     re.IGNORECASE,
 )
 
-# Minimal, non-exhaustive safety net for clearly unsafe requests (self-harm
-# instructions, weapon/explosive construction, csam). This is intentionally
-# small and conservative — it is not a substitute for a real content
-# moderation model, just a last-resort net that doesn't depend on English
-# being the query language for the *unsafe* terms themselves (many of these
-# concepts get typed in Latin script/English even in Tamil/Hindi chats).
+
+_MCQ_PREFIX_RE = re.compile(
+    r"^[A-Da-d][.)]\s*"
+)
+
+
+_ANSWER_PREFIX_RE = re.compile(
+    r"^(?:Answer|Ans|उत्तर|பதில்)\s*[:\-–]\s*",
+    re.IGNORECASE,
+)
+
+
+# =============================================================================
+# MINIMAL SAFETY NET
+# =============================================================================
+
 _UNSAFE_PATTERNS = [
-    re.compile(r"\bhow\s+to\s+make\s+a?\s*(bomb|explosive)\b", re.IGNORECASE),
-    re.compile(r"\bkill\s+myself\b", re.IGNORECASE),
-    re.compile(r"\bsuicide\s+method\b", re.IGNORECASE),
-    re.compile(r"\bchild\s+sexual\b", re.IGNORECASE),
+    re.compile(
+        r"\bhow\s+to\s+make\s+a?\s*"
+        r"(bomb|explosive)\b",
+        re.IGNORECASE,
+    ),
+
+    re.compile(
+        r"\bkill\s+myself\b",
+        re.IGNORECASE,
+    ),
+
+    re.compile(
+        r"\bsuicide\s+method\b",
+        re.IGNORECASE,
+    ),
+
+    re.compile(
+        r"\bchild\s+sexual\b",
+        re.IGNORECASE,
+    ),
 ]
 
-NOT_FOUND_MESSAGE = {
-    "ta": "இந்தக் கேள்விக்கான தகவல் எங்கள் தரவுத்தளத்தில் இல்லை.",
-    "hi": "इस प्रश्न से जुड़ी जानकारी हमारे डेटा में उपलब्ध नहीं है।",
-}
 
-DEFAULT_NOT_FOUND_MESSAGE = "No grounded information was found for this query."
-
+# =============================================================================
+# RESULT TYPE
+# =============================================================================
 
 @dataclass
 class GuardrailResult:
@@ -65,90 +142,352 @@ class GuardrailResult:
     reason: Optional[str] = None
 
 
-def check_input(query: str, language: str) -> GuardrailResult:
-    stage = "input"
+# =============================================================================
+# INPUT
+# =============================================================================
 
-    if not query or not query.strip():
-        return GuardrailResult(False, stage, "empty_query", "Query is empty.")
+def check_input(
+    query: str,
+    language: str,
+) -> GuardrailResult:
 
-    if len(query) > MAX_QUERY_CHARS:
+    stage = (
+        "input"
+    )
+
+
+    if (
+        not query
+        or
+        not query.strip()
+    ):
+
         return GuardrailResult(
-            False, stage, "query_too_long",
-            f"Query exceeds {MAX_QUERY_CHARS} characters.",
+            False,
+            stage,
+            "empty_query",
+            "Query is empty.",
         )
 
-    if language not in SUPPORTED_LANGUAGES:
+
+    if (
+        len(query)
+        >
+        MAX_QUERY_CHARS
+    ):
+
         return GuardrailResult(
-            False, stage, "unsupported_language",
-            f"Language must be one of {sorted(SUPPORTED_LANGUAGES)}.",
+            False,
+            stage,
+            "query_too_long",
+            (
+                f"Query exceeds "
+                f"{MAX_QUERY_CHARS} characters."
+            ),
         )
 
-    for pattern in _UNSAFE_PATTERNS:
-        if pattern.search(query):
-            return GuardrailResult(False, stage, "unsafe_content", "Query matched an unsafe-content pattern.")
 
-    return GuardrailResult(True, stage)
+    if (
+        language
+        not in
+        SUPPORTED_LANGUAGES
+    ):
 
-
-def check_grounding(parents: list, context: str) -> GuardrailResult:
-    stage = "grounding"
-
-    if not parents or not context.strip():
         return GuardrailResult(
-            False, stage, "no_grounded_context",
-            "Retrieval returned no usable context for this query.",
+            False,
+            stage,
+            "unsupported_language",
+            (
+                "Language must be one of "
+                f"{sorted(SUPPORTED_LANGUAGES)}."
+            ),
         )
 
-    return GuardrailResult(True, stage)
+
+    for pattern in (
+        _UNSAFE_PATTERNS
+    ):
+
+        if pattern.search(
+            query
+        ):
+
+            return GuardrailResult(
+                False,
+                stage,
+                "unsafe_content",
+                "Query matched an unsafe-content pattern.",
+            )
 
 
-def _terms(text: str) -> list[str]:
+    return GuardrailResult(
+        True,
+        stage,
+    )
+
+
+# =============================================================================
+# STRUCTURAL GROUNDING
+# =============================================================================
+
+def check_grounding(
+    parents: list,
+    context: str,
+) -> GuardrailResult:
+
+    stage = (
+        "grounding"
+    )
+
+
+    if (
+        not parents
+        or
+        not context.strip()
+    ):
+
+        return GuardrailResult(
+            False,
+            stage,
+            "no_grounded_context",
+            (
+                "Retrieval returned no usable "
+                "context for this query."
+            ),
+        )
+
+
+    return GuardrailResult(
+        True,
+        stage,
+    )
+
+
+# =============================================================================
+# CLEANING
+# =============================================================================
+
+def _terms(
+    text: str,
+) -> list[str]:
+
     terms = []
     current = []
 
-    for char in str(text).casefold():
-        category = unicodedata.category(char)
-        if category and category[0] in {"L", "M", "N"}:
-            current.append(char)
+    for char in str(
+        text
+    ).casefold():
+
+        category = (
+            unicodedata.category(
+                char
+            )
+        )
+
+        if (
+            category
+            and
+            category[0]
+            in {
+                "L",
+                "M",
+                "N",
+            }
+        ):
+
+            current.append(
+                char
+            )
+
         elif current:
-            terms.append("".join(current))
+
+            terms.append(
+                "".join(
+                    current
+                )
+            )
+
             current = []
 
     if current:
-        terms.append("".join(current))
+
+        terms.append(
+            "".join(
+                current
+            )
+        )
 
     return terms
 
 
-_MCQ_PREFIX_RE = re.compile(
-    r"^[A-Da-d][.)]\s*",
-)
+def _clean_answer(
+    answer: str,
+) -> str:
 
-_ANSWER_PREFIX_RE = re.compile(
-    r"^(?:A|Answer|Ans|उत्तर|பதில்)\s*[:\-–]\s*",
-    re.IGNORECASE,
-)
+    cleaned = str(
+        answer
+    ).strip()
+
+    cleaned = (
+        cleaned.replace(
+            "**",
+            "",
+        )
+    )
+
+    cleaned = (
+        _CITATION_RE.sub(
+            "",
+            cleaned,
+        )
+    )
+
+    cleaned = (
+        _MCQ_PREFIX_RE.sub(
+            "",
+            cleaned,
+        )
+    )
+
+    cleaned = (
+        _ANSWER_PREFIX_RE.sub(
+            "",
+            cleaned,
+        )
+    )
+
+    cleaned = (
+        cleaned.replace(
+            "\ufffd",
+            "",
+        )
+    )
+
+    cleaned = " ".join(
+        cleaned.split()
+    )
+
+    return cleaned.strip(
+        " -–—:;,.|"
+    )
 
 
-def _clean_answer(answer: str) -> str:
-    cleaned = str(answer).strip()
-    cleaned = cleaned.replace("**", "")
-    cleaned = _CITATION_RE.sub("", cleaned)
-    # Strip MCQ option prefixes (A. B. C. D.) — the 0.6B model generates these
-    # when evidence contains numbered lists that look like answer choices.
-    cleaned = _MCQ_PREFIX_RE.sub("", cleaned)
-    # Strip A: / Answer: prefixes
-    cleaned = _ANSWER_PREFIX_RE.sub("", cleaned)
-    # Sanitize Unicode replacement character instead of rejecting the whole answer
-    cleaned = cleaned.replace("\ufffd", "")
-    cleaned = " ".join(cleaned.split())
-    return cleaned.strip(" -–—:;,.|")
+# =============================================================================
+# ANSWER → SENTENCE MATCHING
+# =============================================================================
+
+def _answer_is_inside_sentence(
+    answer: str,
+    sentence: str,
+) -> bool:
+    """
+    Require substantially stronger containment than the old
+    "ANY answer term appears" rule.
+
+    Multi-word answer:
+        all meaningful answer terms must appear morphologically.
+
+    Numeric answer:
+        all answer numbers must be present.
+    """
+
+    answer_cf = (
+        answer.casefold()
+    )
+
+    sentence_cf = (
+        sentence.casefold()
+    )
 
 
+    # Best case: exact phrase.
+    if (
+        answer_cf
+        and
+        answer_cf
+        in
+        sentence_cf
+    ):
+        return True
 
 
-from app.rag.evidence_quality import QUESTION_WORDS, split_sentences, split_terms
+    answer_digits = set(
+        re.findall(
+            r"\d+",
+            answer_cf,
+        )
+    )
 
+    sentence_digits = set(
+        re.findall(
+            r"\d+",
+            sentence_cf,
+        )
+    )
+
+
+    if answer_digits:
+
+        if not answer_digits.issubset(
+            sentence_digits
+        ):
+            return False
+
+
+    answer_terms = [
+        term
+        for term
+        in split_terms(
+            answer
+        )
+        if len(term) >= 2
+    ]
+
+
+    # Pure numeric answer.
+    if (
+        answer_digits
+        and
+        not answer_terms
+    ):
+        return True
+
+
+    if not answer_terms:
+        return False
+
+
+    sentence_terms = (
+        split_terms(
+            sentence
+        )
+    )
+
+
+    # Require ALL meaningful answer terms, not merely one.
+    for answer_term in (
+        answer_terms
+    ):
+
+        if not any(
+            term_matches(
+                answer_term,
+                sentence_term,
+            )
+
+            for sentence_term
+            in sentence_terms
+        ):
+
+            return False
+
+
+    return True
+
+
+# =============================================================================
+# CONTEXT SUPPORT VALIDATION
+# =============================================================================
 
 def _supported_by_context(
     answer: str,
@@ -156,78 +495,176 @@ def _supported_by_context(
     query: str = "",
     language: str = "ta",
 ) -> bool:
-    """Validate that the answer is supported within the same sentence in context.
-
-    The supporting sentence must:
-    1. Contain the answer entity (or digits / all key answer terms).
-    2. Contain calibrated informative query overlap (>= 1 strong informative term or >= 25% coverage).
     """
-    sentences = split_sentences(context)
+    Grounding validation at sentence/list-item level.
+
+    A generated answer is accepted only when one evidence unit:
+    1. actually contains the answer,
+    2. substantially aligns with the question,
+    3. satisfies explicit question constraints,
+    4. is not merely an unrelated numbered-list distractor.
+    """
+
+    sentences = (
+        split_sentences(
+            context
+        )
+    )
+
     if not sentences:
         return False
 
-    stopwords = QUESTION_WORDS.get(language, set())
-    query_terms = [
-        t for t in split_terms(query)
-        if len(t) >= 2 and t not in stopwords
-    ]
 
-    answer_terms = [
-        t for t in split_terms(answer)
-        if len(t) >= 2
-    ]
+    query_terms = (
+        informative_query_terms(
+            query,
+            language,
+        )
+    )
 
-    answer_digits = set(re.findall(r"\d+", answer))
 
-    for sent in sentences:
-        sent_terms = set(split_terms(sent))
-        sent_digits = set(re.findall(r"\d+", sent))
+    for sentence in sentences:
 
-        # Check answer containment in this sentence:
-        answer_in_sent = False
-        if answer.casefold() in sent.casefold():
-            answer_in_sent = True
-        elif answer_digits and (answer_digits & sent_digits):
-            answer_in_sent = True
-        elif answer_terms and any(
-            t in sent_terms or (len(t) >= 4 and any(t in st or st in t for st in sent_terms))
-            for t in answer_terms
+
+        # ---------------------------------------------------------
+        # The answer itself must actually occur here.
+        # ---------------------------------------------------------
+
+        if not _answer_is_inside_sentence(
+            answer,
+            sentence,
         ):
-            answer_in_sent = True
-
-        if not answer_in_sent:
             continue
 
-        # If query has informative terms, verify the sentence has query overlap
-        if query_terms:
-            overlap = [
-                qt for qt in query_terms
-                if qt in sent_terms or (len(qt) >= 4 and any(qt in st or st in qt for st in sent_terms))
-            ]
-            if len(overlap) >= 1 or (len(overlap) / len(query_terms)) >= 0.25:
-                return True
-        else:
+
+        # ---------------------------------------------------------
+        # Explicit unit / national / only / superlative constraints.
+        # ---------------------------------------------------------
+
+        if not hard_constraints_satisfied(
+            query,
+            sentence,
+            language,
+        ):
+            continue
+
+
+        (
+            matched,
+            total,
+            coverage,
+        ) = (
+            query_overlap_stats(
+                query,
+                sentence,
+                language,
+            )
+        )
+
+
+        # ---------------------------------------------------------
+        # No informative query terms:
+        # answer containment is enough.
+        # ---------------------------------------------------------
+
+        if total == 0:
             return True
+
+
+        # ---------------------------------------------------------
+        # Very short query:
+        # require every meaningful concept.
+        # ---------------------------------------------------------
+
+        if total <= 2:
+
+            query_supported = (
+                matched
+                ==
+                total
+            )
+
+
+        else:
+
+            # Multiple terms:
+            # require at least two informative matches and
+            # meaningful overall coverage.
+            query_supported = (
+                matched >= 2
+                and
+                coverage >= 0.40
+            )
+
+
+        if not query_supported:
+            continue
+
+
+        # ---------------------------------------------------------
+        # Numbered-list distractor protection.
+        #
+        # Example:
+        #
+        # 1. Mercury ...
+        # 2. Venus ...
+        # 3. Earth ...
+        #
+        # "Mercury" cannot pass just because it appears somewhere
+        # in the retrieved list.
+        # ---------------------------------------------------------
+
+        if (
+            is_list_item(
+                sentence
+            )
+            and
+            coverage < 0.67
+        ):
+            continue
+
+
+        return True
+
 
     return False
 
+
+# =============================================================================
+# REJECTION
+# =============================================================================
 
 def _localized_rejection(
     language: str,
     code: str,
     reason: str,
-) -> tuple[str, GuardrailResult]:
-    message = NOT_FOUND_MESSAGE.get(
-        language,
-        DEFAULT_NOT_FOUND_MESSAGE,
-    )
-    return message, GuardrailResult(
-        False,
-        "output",
-        code,
-        reason,
+) -> tuple[
+    str,
+    GuardrailResult,
+]:
+
+    message = (
+        NOT_FOUND_MESSAGE.get(
+            language,
+            DEFAULT_NOT_FOUND_MESSAGE,
+        )
     )
 
+    return (
+        message,
+
+        GuardrailResult(
+            False,
+            "output",
+            code,
+            reason,
+        ),
+    )
+
+
+# =============================================================================
+# OUTPUT
+# =============================================================================
 
 def apply_output_guardrail(
     answer: str,
@@ -236,111 +673,349 @@ def apply_output_guardrail(
     query: str = "",
     context: str = "",
     possibly_truncated: bool = False,
-) -> tuple[str, GuardrailResult]:
-    """Clean harmless formatting and reject malformed/ungrounded output.
-
-    This is deterministic and adds no model call, preserving first-token
-    latency. Rejected output is surfaced as the localized NOT_FOUND message.
+    strong_evidence: bool = False,
+) -> tuple[
+    str,
+    GuardrailResult,
+]:
     """
-    stage = "output"
+    Deterministic output validation.
 
-    stripped = answer.strip()
-    if stripped == NOT_FOUND_SENTINEL or stripped.startswith(NOT_FOUND_SENTINEL):
-        return _localized_rejection(
-            language,
-            "model_abstained",
-            "Model reported NOT_FOUND.",
+    Adds effectively negligible latency.
+    """
+
+    stage = (
+        "output"
+    )
+
+
+    stripped = str(
+        answer
+    ).strip()
+
+
+    # ---------------------------------------------------------
+    # MODEL ABSTENTION
+    # ---------------------------------------------------------
+
+    if (
+        stripped
+        ==
+        NOT_FOUND_SENTINEL
+        or
+        stripped.startswith(
+            NOT_FOUND_SENTINEL
+        )
+    ):
+
+        code = (
+            "model_abstained_on_strong_evidence"
+            if strong_evidence
+            else "model_abstained"
         )
 
+        reason = (
+            "Model reported NOT_FOUND despite strong packed evidence."
+            if strong_evidence
+            else "Model reported NOT_FOUND."
+        )
+
+        return _localized_rejection(
+            language,
+            code,
+            reason,
+        )
+
+
+    # ---------------------------------------------------------
+    # EMPTY
+    # ---------------------------------------------------------
+
     if not stripped:
+
         return _localized_rejection(
             language,
             "empty_answer",
             "Model returned an empty answer.",
         )
 
-    if _CITATION_ONLY_RE.fullmatch(stripped):
+
+    # ---------------------------------------------------------
+    # CITATION ONLY
+    # ---------------------------------------------------------
+
+    if (
+        _CITATION_ONLY_RE.fullmatch(
+            stripped
+        )
+    ):
+
         return _localized_rejection(
             language,
             "citation_only",
             "Model returned a citation without an answer.",
         )
 
+
+    # ---------------------------------------------------------
+    # TOKEN LIMIT
+    # ---------------------------------------------------------
+
     if possibly_truncated:
+
         return _localized_rejection(
             language,
             "truncated_answer",
-            "Model output hit token limit before completing.",
+            "Model output hit the token limit before completing.",
         )
 
-    cleaned = _clean_answer(stripped)
+
+    cleaned = (
+        _clean_answer(
+            stripped
+        )
+    )
+
 
     if not cleaned:
+
         return _localized_rejection(
             language,
             "empty_answer",
             "Model returned an empty answer after cleaning.",
         )
 
-    # Context-echo guard: reject only when the model copies an entire long
-    # sentence or clause (>= 50 chars) from the beginning of the context.
-    if context and len(cleaned) >= 50 and cleaned in context[:120]:
+
+    # ---------------------------------------------------------
+    # LONG CONTEXT ECHO
+    # ---------------------------------------------------------
+
+    if (
+        context
+        and
+        len(cleaned)
+        >= 50
+        and
+        cleaned
+        in
+        context[
+            :160
+        ]
+    ):
+
         return _localized_rejection(
             language,
             "context_echo",
-            "Model copied context text instead of extracting an answer.",
+            "Model copied a long context fragment instead of extracting an answer.",
         )
 
-    answer_terms = _terms(cleaned)
-    for left, middle, right in zip(
+
+    # ---------------------------------------------------------
+    # REPETITION
+    # ---------------------------------------------------------
+
+    answer_terms = (
+        _terms(
+            cleaned
+        )
+    )
+
+
+    for (
+        left,
+        middle,
+        right,
+    ) in zip(
         answer_terms,
-        answer_terms[1:],
-        answer_terms[2:],
+        answer_terms[
+            1:
+        ],
+        answer_terms[
+            2:
+        ],
     ):
-        if left == middle == right:
+
+        if (
+            left
+            ==
+            middle
+            ==
+            right
+        ):
+
             return _localized_rejection(
                 language,
                 "repeated_answer",
                 "Model output contains excessive repetition.",
             )
 
-    query_terms = set(_terms(query))
+
+    # ---------------------------------------------------------
+    # QUESTION ECHO
+    # ---------------------------------------------------------
+
+    query_terms = set(
+        _terms(
+            query
+        )
+    )
+
+
     meaningful_new = [
-        t for t in answer_terms
-        if t not in query_terms and len(t) >= 4
+        term
+        for term
+        in answer_terms
+
+        if (
+            term
+            not in
+            query_terms
+            and
+            len(term)
+            >= 4
+        )
     ]
-    if answer_terms and not meaningful_new and set(answer_terms).issubset(query_terms):
+
+
+    if (
+        answer_terms
+        and
+        not meaningful_new
+        and
+        set(
+            answer_terms
+        ).issubset(
+            query_terms
+        )
+    ):
+
         return _localized_rejection(
             language,
             "question_echo",
             "Model repeated the question instead of answering it.",
         )
 
-    target_script = _TARGET_SCRIPT.get(language)
-    has_target_script = bool(target_script and target_script.search(cleaned))
-    has_latin_or_numbers = bool(re.search(r"[a-zA-Z0-9]", cleaned))
-    if not (has_target_script or has_latin_or_numbers or _NUMERIC_ANSWER_RE.fullmatch(cleaned)):
+
+    # ---------------------------------------------------------
+    # SCRIPT
+    # ---------------------------------------------------------
+
+    target_script = (
+        _TARGET_SCRIPT.get(
+            language
+        )
+    )
+
+
+    has_target_script = bool(
+        target_script
+        and
+        target_script.search(
+            cleaned
+        )
+    )
+
+
+    has_latin_or_numbers = bool(
+        re.search(
+            r"[a-zA-Z0-9]",
+            cleaned,
+        )
+    )
+
+
+    if not (
+        has_target_script
+        or
+        has_latin_or_numbers
+        or
+        _NUMERIC_ANSWER_RE
+        .fullmatch(
+            cleaned
+        )
+    ):
+
         return _localized_rejection(
             language,
             "wrong_language",
             "Model answered in an unsupported script.",
         )
 
-    if context and not _supported_by_context(
-        cleaned,
-        context,
-        query=query,
-        language=language,
+
+    # ---------------------------------------------------------
+    # ACTUAL GROUNDING
+    # ---------------------------------------------------------
+
+    if (
+        context
+        and
+        not _supported_by_context(
+            cleaned,
+            context,
+            query=
+                query,
+            language=
+                language,
+        )
     ):
+
         return _localized_rejection(
             language,
             "unsupported_answer",
-            "Generated answer text is not supported by a matching sentence in packed evidence.",
+            (
+                "Generated answer is not supported by "
+                "a query-aligned evidence sentence."
+            ),
         )
 
-    return cleaned, GuardrailResult(True, stage)
+
+    return (
+        cleaned,
+
+        GuardrailResult(
+            True,
+            stage,
+        ),
+    )
 
 
-def not_found_response_text(language: str) -> str:
-    return NOT_FOUND_MESSAGE.get(language, DEFAULT_NOT_FOUND_MESSAGE)
+# =============================================================================
+# USER-FACING NOT FOUND
+# =============================================================================
 
+def not_found_response_text(
+    language: str,
+) -> str:
+
+    return (
+        NOT_FOUND_MESSAGE.get(
+            language,
+            DEFAULT_NOT_FOUND_MESSAGE,
+        )
+    )
+
+
+# =============================================================================
+# FACADE
+# =============================================================================
+
+class Guardrails:
+
+    check_input = staticmethod(
+        check_input
+    )
+
+    check_grounding = staticmethod(
+        check_grounding
+    )
+
+    apply_output_guardrail = staticmethod(
+        apply_output_guardrail
+    )
+
+    not_found_response_text = staticmethod(
+        not_found_response_text
+    )
+
+
+guardrails = Guardrails()
