@@ -1632,29 +1632,22 @@ class FullRAG:
             {
                 "role": "system",
                 "content": (
-                    "Extract the answer to Q from C. "
-                    "Output only the answer word or phrase.\n\n"
-                    "Q: भारत की राजधानी क्या है?\n"
-                    "C: नई दिल्ली भारत की राजधानी है।\n"
-                    "Answer: नई दिल्ली\n\n"
-                    "Q: தமிழ்நாட்டின் தலைநகரம் எது?\n"
-                    "C: சென்னை தமிழ்நாட்டின் தலைநகரமாகும்.\n"
-                    "Answer: சென்னை\n\n"
-                    "If C has no relevant information, output NOT_FOUND."
+                    "You are a precise factual QA assistant. "
+                    "Extract and output ONLY the direct answer to the question using the provided context. "
+                    "Output just the factual name, entity, or number in the language of the question. "
+                    "If the context contains no answer, output NOT_FOUND."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Q: {query}\n"
-                    f"C: {context}"
+                    f"Context:\n{context}\n\n"
+                    f"Question:\n{query}\n\n"
+                    "Answer:"
                 ),
             },
         ]
 
-        # apply_chat_template adds <|im_start|>assistant\n — we then
-        # immediately prefix "Answer: " so the model completes from that
-        # cue, matching the few-shot pattern exactly.
         prompt = (
             self.gen_tokenizer
             .apply_chat_template(
@@ -1666,7 +1659,6 @@ class FullRAG:
 
                 enable_thinking=False,
             )
-            + "Answer: "
         )
 
 
@@ -1713,20 +1705,6 @@ class FullRAG:
         )
 
 
-        # Resolve newline token ID for use as a stop token.
-        # The few-shot examples show one-line answers, so the model
-        # naturally emits \n after the entity.  Treating \n as EOS
-        # ensures it stops immediately after the answer span.
-        newline_ids = self.gen_tokenizer.encode(
-            "\n", add_special_tokens=False
-        )
-
-        stop_ids = [
-            self.gen_tokenizer.eos_token_id,
-        ]
-        if newline_ids:
-            stop_ids.append(newline_ids[0])
-
         kwargs = {
             **inputs,
 
@@ -1741,16 +1719,6 @@ class FullRAG:
 
             "use_cache":
                 True,
-
-            "eos_token_id":
-                stop_ids,
-
-            # Discourage verbatim copying of long context sequences.
-            # Value > 1.0 penalises tokens that already appeared in
-            # the input, steering the model toward novel entity words
-            # rather than echoing the evidence passage.
-            "repetition_penalty":
-                1.3,
         }
 
 
@@ -1801,9 +1769,12 @@ class FullRAG:
             )
         )
 
-        # Take first line only — the few-shot pattern teaches the
-        # model that the answer is a single line after "Answer: ".
-        answer = raw_answer.split("\n")[0].strip()
+        lines = [
+            line.strip()
+            for line in raw_answer.strip().split("\n")
+            if line.strip()
+        ]
+        answer = lines[0] if lines else ""
 
 
 
@@ -1844,9 +1815,6 @@ class FullRAG:
                 +
                 complete_ms,
 
-            # Absolute timestamps for clean complete-latency calculation.
-            # Callers compute full_rag_complete_ms as:
-            #   (completed_at - overall_start) * 1000
             "first_token_at":
                 streamer.first_token_at,
 

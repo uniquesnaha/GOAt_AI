@@ -252,11 +252,9 @@ def apply_output_guardrail(
             "Model returned an empty answer after cleaning.",
         )
 
-    # Context-echo guard: the 0.6B model sometimes copies the start of
-    # evidence verbatim when it cannot find a real answer.  If the cleaned
-    # answer (long enough to not be a legitimate short entity) appears as a
-    # substring of the context's first 80 characters, reject it.
-    if context and len(cleaned) > 20 and cleaned in context[:80]:
+    # Context-echo guard: reject only when the model copies an entire long
+    # sentence or clause (>= 50 chars) from the beginning of the context.
+    if context and len(cleaned) >= 50 and cleaned in context[:120]:
         return _localized_rejection(
             language,
             "context_echo",
