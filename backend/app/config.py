@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default_factory=lambda: ["*"], validation_alias="GOAT_CORS_ORIGINS")
     corpus_profile: str = Field(default="25k", validation_alias="GOAT_CORPUS_PROFILE")
 
+    gen_model: str = Field(default="bigscience/mt0-small", validation_alias="GOAT_GEN_MODEL")
+    gen_backend: str = Field(default="seq2seq", validation_alias="GOAT_GEN_BACKEND")
+    gen_max_input_tokens: int = Field(default=256, validation_alias="GOAT_GEN_MAX_INPUT_TOKENS")
+    gen_max_new_tokens: int = Field(default=16, validation_alias="GOAT_GEN_MAX_NEW_TOKENS")
+
 
 settings = Settings()
 

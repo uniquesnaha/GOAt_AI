@@ -35,6 +35,7 @@ from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 from transformers import (
     AutoModelForCausalLM,
+    AutoModelForSeq2SeqLM,
     AutoTokenizer,
 )
 from transformers.generation.streamers import BaseStreamer
@@ -120,7 +121,13 @@ EMBED_MODEL = (
 )
 
 GEN_MODEL = (
-    "Qwen/Qwen3-0.6B"
+    settings.gen_model
+)
+
+GEN_BACKEND = (
+    settings.gen_backend
+    .strip()
+    .lower()
 )
 
 EMBED_DIM = 256
@@ -1382,6 +1389,21 @@ def _clean_short_answer(answer: str) -> str:
     return first_line
 
 
+def _build_generation_prompt(
+    query: str,
+    context: str,
+) -> str:
+    return (
+        "Answer the question using only the evidence.\n"
+        "Return only the shortest answer.\n"
+        "Do not explain.\n"
+        "If the answer is not present, output NOT_FOUND.\n\n"
+        f"Evidence: {context}\n\n"
+        f"Question: {query}\n\n"
+        "Answer:"
+    )
+
+
 # =============================================================================
 # FIRST TOKEN STREAMER
 # =============================================================================
@@ -1393,11 +1415,13 @@ class FirstTokenStreamer(
     def __init__(
         self,
         tokenizer,
+        is_seq2seq: bool = False,
     ):
 
         self.tokenizer = tokenizer
+        self.is_seq2seq = is_seq2seq
 
-        self.ignore_prompt = True
+        self.ignore_initial_token = True
 
         self.first_token_at = None
         self.completed_at = None
@@ -1423,9 +1447,9 @@ class FirstTokenStreamer(
         )
 
 
-        if self.ignore_prompt:
+        if self.ignore_initial_token:
 
-            self.ignore_prompt = False
+            self.ignore_initial_token = False
             return
 
 
@@ -1510,7 +1534,7 @@ class FullRAG:
 
 
         print(
-            "Loading Qwen generator..."
+            f"Loading {GEN_BACKEND} generator ({GEN_MODEL})..."
         )
 
 
@@ -1529,21 +1553,45 @@ class FullRAG:
         )
 
 
-        self.generator = (
-            AutoModelForCausalLM
-            .from_pretrained(
-                GEN_MODEL,
+        if GEN_BACKEND == "seq2seq":
 
-                torch_dtype=
-                    torch.float16,
+            self.generator = (
+                AutoModelForSeq2SeqLM
+                .from_pretrained(
+                    GEN_MODEL,
 
-                device_map=
-                    "cuda",
+                    torch_dtype=
+                        torch.float16,
 
-                attn_implementation=
-                    "sdpa",
+                    low_cpu_mem_usage=
+                        True,
+                )
+                .to("cuda")
             )
-        )
+
+        elif GEN_BACKEND == "causal":
+
+            self.generator = (
+                AutoModelForCausalLM
+                .from_pretrained(
+                    GEN_MODEL,
+
+                    torch_dtype=
+                        torch.float16,
+
+                    device_map=
+                        "cuda",
+
+                    attn_implementation=
+                        "sdpa",
+                )
+            )
+
+        else:
+
+            raise RuntimeError(
+                f"Unsupported generator backend: {GEN_BACKEND}"
+            )
 
 
         self.generator.eval()
@@ -2015,11 +2063,14 @@ class FullRAG:
         self,
         query,
         context,
-        max_new_tokens,
+        max_new_tokens=None,
         language="ta",
     ):
 
         stage_start = time.perf_counter()
+
+        if max_new_tokens is None:
+            max_new_tokens = settings.gen_max_new_tokens
 
         if not str(context).strip():
             return {
@@ -2042,60 +2093,72 @@ class FullRAG:
                 "possibly_truncated": False,
             }
 
-        # Keep this signal for telemetry only. Never tell the model that a
-        # heuristic has "verified" the answer.
+        # Keep this signal for telemetry only.
         support = strongest_supporting_unit(
             query,
             context,
             language,
         )
 
-        # Deliberately short: tiny models follow compact extraction prompts more
-        # reliably, and fewer prompt tokens improve prefill/TTFT.
-        system_content = (
-            "Extract the answer from Evidence only. "
-            "Copy the shortest exact span that answers Question. "
-            "Output that span only. "
-            "If absent, output exactly NOT_FOUND. "
-            "Do not use outside knowledge."
-        )
+        if GEN_BACKEND == "seq2seq":
 
-        messages = [
-            {
-                "role": "system",
-                "content": system_content,
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Evidence:\n{context}\n\n"
-                    f"Question:\n{query}\n\n"
-                    "Answer:"
-                ),
-            },
-        ]
+            prompt = _build_generation_prompt(
+                query,
+                context,
+            )
 
-        template_kwargs = {
-            "tokenize": False,
-            "add_generation_prompt": True,
-        }
+            inputs = self.gen_tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=settings.gen_max_input_tokens,
+            ).to("cuda")
 
-        # Qwen3 supports hard non-thinking mode. Keep the engine configurable
-        # so another generator can be benchmarked without rewriting this file.
-        if "qwen3" in GEN_MODEL.casefold():
-            template_kwargs["enable_thinking"] = False
+        else:
 
-        prompt = self.gen_tokenizer.apply_chat_template(
-            messages,
-            **template_kwargs,
-        )
+            # Causal LM (e.g. Qwen fallback)
+            system_content = (
+                "Extract the answer from Evidence only. "
+                "Copy the shortest exact span that answers Question. "
+                "Output that span only. "
+                "If absent, output exactly NOT_FOUND. "
+                "Do not use outside knowledge."
+            )
 
-        inputs = self.gen_tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=2048,
-        ).to("cuda")
+            messages = [
+                {
+                    "role": "system",
+                    "content": system_content,
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Evidence:\n{context}\n\n"
+                        f"Question:\n{query}\n\n"
+                        "Answer:"
+                    ),
+                },
+            ]
+
+            template_kwargs = {
+                "tokenize": False,
+                "add_generation_prompt": True,
+            }
+
+            if "qwen3" in GEN_MODEL.casefold():
+                template_kwargs["enable_thinking"] = False
+
+            prompt = self.gen_tokenizer.apply_chat_template(
+                messages,
+                **template_kwargs,
+            )
+
+            inputs = self.gen_tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=2048,
+            ).to("cuda")
 
         prompt_tokens = int(
             inputs["input_ids"].shape[1]
@@ -2106,7 +2169,8 @@ class FullRAG:
         ) * 1000
 
         streamer = FirstTokenStreamer(
-            self.gen_tokenizer
+            self.gen_tokenizer,
+            is_seq2seq=(GEN_BACKEND == "seq2seq"),
         )
 
         kwargs = {
@@ -2115,23 +2179,23 @@ class FullRAG:
             "max_new_tokens": max_new_tokens,
             "do_sample": False,
             "use_cache": True,
-            "pad_token_id": self.gen_tokenizer.eos_token_id,
         }
+
+        if self.gen_tokenizer.eos_token_id is not None:
+            kwargs["pad_token_id"] = self.gen_tokenizer.eos_token_id
+
+        if GEN_BACKEND == "seq2seq":
+            kwargs["num_beams"] = 1
 
         torch.cuda.synchronize()
         model_start = time.perf_counter()
 
-        # No Python worker thread here: this function returns only after the
-        # answer is complete, so a worker adds overhead without making the first
-        # token user-visible. The streamer still timestamps token #1 precisely.
         self.generator.generate(
             **kwargs
         )
 
         if streamer.first_token_at is None:
-            raise RuntimeError(
-                "No generated token received"
-            )
+            streamer.first_token_at = time.perf_counter()
 
         raw_answer = self.gen_tokenizer.decode(
             streamer.generated_ids,
@@ -2147,8 +2211,7 @@ class FullRAG:
             context,
         )
 
-        # Fail closed on hallucinations. For an extractive benchmark it is
-        # better to abstain than return a confident answer absent from evidence.
+        # Fail closed on hallucinations.
         if not grounded:
             answer = "NOT_FOUND"
 
@@ -2157,8 +2220,12 @@ class FullRAG:
         ) * 1000
 
         complete_ms = (
-            streamer.completed_at - model_start
+            (streamer.completed_at or time.perf_counter()) - model_start
         ) * 1000
+
+        generated_tokens = len(
+            streamer.generated_ids
+        )
 
         return {
             "answer": answer,
@@ -2176,9 +2243,9 @@ class FullRAG:
             "generation_complete_ms": prep_ms + complete_ms,
             "first_token_at": streamer.first_token_at,
             "completed_at": streamer.completed_at,
-            "generated_tokens": len(streamer.generated_ids),
+            "generated_tokens": generated_tokens,
             "possibly_truncated": (
-                len(streamer.generated_ids) >= max_new_tokens
+                generated_tokens >= max_new_tokens
             ),
         }
 
@@ -2191,7 +2258,43 @@ class FullRAG:
         self,
     ) -> None:
 
-        warmup_queries = [
+        # 1. Direct generator warmups (compiles CUDA kernels)
+        generator_warmup_samples = [
+            (
+                "இந்தியாவின் தலைநகரம் எது?",
+                "இந்தியாவின் தலைநகரம் புதுதில்லி ஆகும்.",
+                "ta",
+            ),
+            (
+                "தாவரங்கள் ஒளிச்சேர்க்கைக்கு பயன்படுத்தும் வாயு எது?",
+                "தாவரங்கள் ஒளிச்சேர்க்கைக்கு கார்பன் டை ஆக்சைடு வாயுவை பயன்படுத்துகின்றன.",
+                "ta",
+            ),
+            (
+                "भारत की राजधानी क्या है?",
+                "भारत की राजधानी नई दिल्ली है।",
+                "hi",
+            ),
+            (
+                "सौरमंडल का सबसे बड़ा ग्रह कौन सा है?",
+                "बृहस्पति सौरमंडल का सबसे बड़ा ग्रह है।",
+                "hi",
+            ),
+        ]
+
+        for query, ctx, lang in generator_warmup_samples:
+            try:
+                self.generate(
+                    query,
+                    ctx,
+                    settings.gen_max_new_tokens,
+                    language=lang,
+                )
+            except Exception as exc:
+                print(f"Generator warmup warning ({lang}): {exc}")
+
+        # 2. End-to-end RAG pipeline warmups (embedder + Qdrant + BM25 + Context + Generator)
+        full_rag_queries = [
             (
                 "இந்தியாவின் தலைநகரம் எது?",
                 "ta",
@@ -2202,64 +2305,38 @@ class FullRAG:
             ),
         ]
 
-
-        for query, language in (
-            warmup_queries
-        ):
-
+        for query, language in full_rag_queries:
             try:
-
-                retrieval = (
-                    self.retrieve(
-                        query,
-                        language,
-                    )
+                retrieval = self.retrieve(
+                    query,
+                    language,
                 )
-
 
                 (
                     context,
                     _,
                     _,
                     _,
-                ) = (
-                    self.contexts.build(
-                        language,
-                        query,
-
-                        retrieval[
-                            "parents"
-                        ],
-
-                        CONTEXT_CHAR_BUDGET,
-                        MAX_CONTEXT_PARENTS,
-                        PER_CHUNK_CHARS,
-
-                        evidence_by_parent=
-                            retrieval.get(
-                                "evidence_by_parent",
-                                {},
-                            ),
-                    )
+                ) = self.contexts.build(
+                    language,
+                    query,
+                    retrieval["parents"],
+                    CONTEXT_CHAR_BUDGET,
+                    MAX_CONTEXT_PARENTS,
+                    PER_CHUNK_CHARS,
+                    evidence_by_parent=retrieval.get(
+                        "evidence_by_parent",
+                        {},
+                    ),
                 )
 
-
                 if context:
-
                     self.generate(
                         query,
                         context,
-                        8,
-
-                        language=
-                            language,
+                        settings.gen_max_new_tokens,
+                        language=language,
                     )
 
-
             except Exception as exc:
-
-                print(
-                    f"Warmup warning "
-                    f"for {language}: "
-                    f"{exc}"
-                )
+                print(f"Full RAG warmup warning for {language}: {exc}")
