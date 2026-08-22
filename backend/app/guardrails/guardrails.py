@@ -147,46 +147,69 @@ def _clean_answer(answer: str) -> str:
 
 
 
-def _supported_by_context(answer: str, context: str) -> bool:
-    """Require at least one meaningful answer term or number to occur in evidence."""
+from app.rag.evidence_quality import QUESTION_WORDS, split_sentences, split_terms
 
-    answer_terms = [
-        term
-        for term in _terms(answer)
-        if len(term) >= 2
+
+def _supported_by_context(
+    answer: str,
+    context: str,
+    query: str = "",
+    language: str = "ta",
+) -> bool:
+    """Validate that the answer is supported within the same sentence in context.
+
+    The supporting sentence must:
+    1. Contain the answer entity (or digits / all key answer terms).
+    2. Contain calibrated informative query overlap (>= 1 strong informative term or >= 25% coverage).
+    """
+    sentences = split_sentences(context)
+    if not sentences:
+        return False
+
+    stopwords = QUESTION_WORDS.get(language, set())
+    query_terms = [
+        t for t in split_terms(query)
+        if len(t) >= 2 and t not in stopwords
     ]
 
-    # Numeric grounding: if answer contains digits that appear in context, it is grounded
+    answer_terms = [
+        t for t in split_terms(answer)
+        if len(t) >= 2
+    ]
+
     answer_digits = set(re.findall(r"\d+", answer))
-    context_digits = set(re.findall(r"\d+", context))
-    if answer_digits and (answer_digits & context_digits):
-        return True
 
-    if not answer_terms:
-        return bool(
-            re.search(r"\d", answer)
-            and re.search(r"\d", context)
-        )
+    for sent in sentences:
+        sent_terms = set(split_terms(sent))
+        sent_digits = set(re.findall(r"\d+", sent))
 
-    context_terms = set(
-        _terms(context)
-    )
+        # Check answer containment in this sentence:
+        answer_in_sent = False
+        if answer.casefold() in sent.casefold():
+            answer_in_sent = True
+        elif answer_digits and (answer_digits & sent_digits):
+            answer_in_sent = True
+        elif answer_terms and any(
+            t in sent_terms or (len(t) >= 4 and any(t in st or st in t for st in sent_terms))
+            for t in answer_terms
+        ):
+            answer_in_sent = True
 
-    return any(
-        answer_term == context_term
-        or (
-            min(
-                len(answer_term),
-                len(context_term),
-            ) >= 3
-            and (
-                answer_term in context_term
-                or context_term in answer_term
-            )
-        )
-        for answer_term in answer_terms
-        for context_term in context_terms
-    )
+        if not answer_in_sent:
+            continue
+
+        # If query has informative terms, verify the sentence has query overlap
+        if query_terms:
+            overlap = [
+                qt for qt in query_terms
+                if qt in sent_terms or (len(qt) >= 4 and any(qt in st or st in qt for st in sent_terms))
+            ]
+            if len(overlap) >= 1 or (len(overlap) / len(query_terms)) >= 0.25:
+                return True
+        else:
+            return True
+
+    return False
 
 
 def _localized_rejection(
@@ -225,7 +248,7 @@ def apply_output_guardrail(
     if stripped == NOT_FOUND_SENTINEL or stripped.startswith(NOT_FOUND_SENTINEL):
         return _localized_rejection(
             language,
-            "ungrounded_answer",
+            "model_abstained",
             "Model reported NOT_FOUND.",
         )
 
@@ -241,6 +264,13 @@ def apply_output_guardrail(
             language,
             "citation_only",
             "Model returned a citation without an answer.",
+        )
+
+    if possibly_truncated:
+        return _localized_rejection(
+            language,
+            "truncated_answer",
+            "Model output hit token limit before completing.",
         )
 
     cleaned = _clean_answer(stripped)
@@ -275,10 +305,6 @@ def apply_output_guardrail(
             )
 
     query_terms = set(_terms(query))
-    # Only fire question_echo when the answer adds NO new meaningful term.
-    # A "meaningful new term" is any answer word >= 4 chars NOT already in the query.
-    # This prevents blocking valid specific entities (e.g. "மயில்", "प्रशांत", "சந்திரன்")
-    # while still catching pure echoes like answering "பறவை" to a "பறவை" question.
     meaningful_new = [
         t for t in answer_terms
         if t not in query_terms and len(t) >= 4
@@ -291,7 +317,6 @@ def apply_output_guardrail(
         )
 
     target_script = _TARGET_SCRIPT.get(language)
-    # Permissive script check: allow target script, Latin alphabet (for entities/units), or numeric answers
     has_target_script = bool(target_script and target_script.search(cleaned))
     has_latin_or_numbers = bool(re.search(r"[a-zA-Z0-9]", cleaned))
     if not (has_target_script or has_latin_or_numbers or _NUMERIC_ANSWER_RE.fullmatch(cleaned)):
@@ -304,11 +329,13 @@ def apply_output_guardrail(
     if context and not _supported_by_context(
         cleaned,
         context,
+        query=query,
+        language=language,
     ):
         return _localized_rejection(
             language,
             "unsupported_answer",
-            "Generated answer text is not supported by the packed evidence.",
+            "Generated answer text is not supported by a matching sentence in packed evidence.",
         )
 
     return cleaned, GuardrailResult(True, stage)
@@ -316,3 +343,4 @@ def apply_output_guardrail(
 
 def not_found_response_text(language: str) -> str:
     return NOT_FOUND_MESSAGE.get(language, DEFAULT_NOT_FOUND_MESSAGE)
+

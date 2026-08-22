@@ -37,13 +37,16 @@ def load_engine() -> None:
     from app.rag.engine import FullRAG
 
     try:
-        app.state.engine = FullRAG()
+        engine = FullRAG()
+        engine.warmup()
+        app.state.engine = engine
         app.state.engine_load_error = None
-        logger.info("RAG engine loaded.")
+        logger.info("RAG engine loaded and warmed up.")
     except Exception as exc:  # noqa: BLE001 - startup readiness gate, not a RAG-logic path
         app.state.engine = None
         app.state.engine_load_error = str(exc)
         logger.error("RAG engine failed to load: %s", exc)
+
 
 
 if __name__ == "__main__":

@@ -80,3 +80,46 @@ def evidence_relevance_score(
         )
 
     return sum(matches(term) for term in query_terms) / len(query_terms)
+
+
+import re
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.?!।\n])\s+")
+
+
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split text into sentences supporting Tamil/Hindi punctuation (., ?, !, ।, newlines)."""
+    raw_sentences = _SENTENCE_SPLIT_RE.split(str(text).strip())
+    sentences = []
+    for s in raw_sentences:
+        s = s.strip()
+        if s:
+            sentences.append(s)
+    return sentences or ([str(text).strip()] if str(text).strip() else [])
+
+
+def score_sentence(
+    query: str,
+    sentence: str,
+    language: str,
+) -> float:
+    """Score a single candidate sentence for informative query relevance with list penalties."""
+    cov = evidence_relevance_score(query, sentence, language)
+    if cov <= 0.0:
+        return 0.0
+
+    score = cov * 10.0
+
+    stopwords = QUESTION_WORDS.get(language, set())
+    clean_query = " ".join([t for t in split_terms(query) if t not in stopwords])
+    if len(clean_query) >= 6 and clean_query in sentence.casefold():
+        score += 3.0
+
+    numbered_items = len(re.findall(r"\b\d+\s*[\.\)]", sentence))
+    if numbered_items >= 2:
+        score -= 2.0 * (numbered_items - 1)
+
+    return max(score, 0.0)

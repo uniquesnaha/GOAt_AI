@@ -42,7 +42,11 @@ from transformers import (
 from transformers.generation.streamers import BaseStreamer
 
 from app.config import settings
-from app.rag.evidence_quality import evidence_relevance_score
+from app.rag.evidence_quality import (
+    evidence_relevance_score,
+    score_sentence,
+    split_sentences,
+)
 
 ROOT = Path(settings.data_root)
 
@@ -592,28 +596,37 @@ def evidence_window(
     text: str,
     query: str,
     max_chars: int,
+    language: str = "ta",
 ) -> str:
-    """
-    Return the ~max_chars character region of `text` that covers the most
-    query terms, snapped to complete word boundaries.
-    Interrogatives and superlatives are downweighted so the window centres
-    on content/entity terms rather than question-type words.
-    Does NOT alter retrieval ranking.
-    """
+    """Return the highest-scoring complete sentence(s) fitting inside max_chars.
 
+    Prioritizes complete informative sentences. Falls back to query-centered
+    word-boundary snapping if no individual sentence carries positive score.
+    """
     text = " ".join(str(text).split())
-
     if len(text) <= max_chars:
         return text
 
-    # Interrogatives/superlatives carry no positional signal — they appear
-    # in both query and all passages.  Downweight them so the best window
-    # centres on noun/entity terms instead.
+    sentences = split_sentences(text)
+    if sentences:
+        scored = []
+        for idx, s in enumerate(sentences):
+            sc = score_sentence(query, s, language)
+            scored.append((sc, idx, s))
+        scored.sort(key=lambda x: -x[0])
+        best_sc, best_idx, best_sent = scored[0]
+
+        if best_sc > 0.0 and len(best_sent) <= max_chars:
+            result = best_sent
+            if best_idx + 1 < len(sentences):
+                cand = result + " " + sentences[best_idx + 1]
+                if len(cand) <= max_chars:
+                    result = cand
+            return result.strip()
+
     _FILLER_TERMS: set[str] = {
-        # Tamil interrogatives & superlatives
         "எது", "என்ன", "எந்த", "எத்தனை", "யார்", "எங்கே",
         "உள்ளது", "ஆகும்", "மிக", "மிகவும்", "ஒரே",
-        # Hindi interrogatives & superlatives
         "क्या", "कौन", "कौनसा", "कहाँ", "कैसे",
         "है", "हैं", "सबसे", "सबसेबड़ा", "सबसेछोटा",
         "सबसेलंबा", "सबसेतेज", "सबसेलम्बी",
@@ -625,21 +638,18 @@ def evidence_window(
         if len(term) >= 2
     ]
 
-    # Assign each query term a weight: filler/interrogative = 0.2, else 1.0
     term_weights = {
         term: (0.2 if term.casefold() in _FILLER_TERMS else 1.0)
         for term in query_terms
     }
 
     def _snap_to_words(raw_start: int, raw_end: int) -> str:
-        # Snap start forward to word boundary if slicing mid-word
         if raw_start > 0:
             space_after = text.find(" ", raw_start)
             start = (space_after + 1) if (space_after != -1 and space_after < raw_end) else raw_start
         else:
             start = 0
 
-        # Snap end backward to word boundary if slicing mid-word
         if raw_end < len(text):
             space_before = text.rfind(" ", start, raw_end)
             end = space_before if (space_before > start) else raw_end
@@ -652,9 +662,7 @@ def evidence_window(
         return _snap_to_words(0, max_chars)
 
     folded = text.casefold()
-
     positions = []
-
     for term in query_terms:
         pos = folded.find(term.casefold())
         if pos >= 0:
@@ -667,29 +675,15 @@ def evidence_window(
     best_score = -1.0
 
     for position in positions:
-        raw_start = max(
-            0,
-            position - max_chars // 3,
-        )
-
-        raw_end = min(
-            len(text),
-            raw_start + max_chars,
-        )
-
+        raw_start = max(0, position - max_chars // 3)
+        raw_end = min(len(text), raw_start + max_chars)
         window = _snap_to_words(raw_start, raw_end)
-
-        window_terms = set(
-            word_splitter(window)
-        )
-
-        # Weighted coverage: entity terms count fully, fillers count 0.2
+        window_terms = set(word_splitter(window))
         score = sum(
             weight
             for term, weight in term_weights.items()
             if term.casefold() in {t.casefold() for t in window_terms}
         )
-
         if score > best_score:
             best_score = score
             best_window = window
@@ -1036,6 +1030,7 @@ class ContextStore:
                 selected_text,
                 query,
                 per_chunk_chars,
+                language=language,
             )
 
             # Source numbers remain in used_evidence/UI metadata. Do not put
@@ -1832,3 +1827,28 @@ class FullRAG:
                 max_new_tokens
             ),
         }
+
+
+    def warmup(self) -> None:
+        """Run startup warmup for Tamil and Hindi queries to pre-compile CUDA kernels."""
+        warmup_queries = [
+            ("இந்தியாவின் தலைநகரம் எது?", "ta"),
+            ("भारत की राजधानी क्या है?", "hi"),
+        ]
+        for q, lang in warmup_queries:
+            try:
+                ret = self.retrieve(q, lang)
+                ctx, _, _, _ = self.contexts.build(
+                    lang,
+                    q,
+                    ret["parents"],
+                    CONTEXT_CHAR_BUDGET,
+                    MAX_CONTEXT_PARENTS,
+                    PER_CHUNK_CHARS,
+                    evidence_by_parent=ret.get("evidence_by_parent", {}),
+                )
+                if ctx:
+                    self.generate(q, ctx, 16)
+            except Exception as exc:
+                print(f"Warmup warning for {lang}: {exc}")
+
