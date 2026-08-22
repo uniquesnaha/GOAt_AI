@@ -190,16 +190,20 @@ HNSW_EF = 64
 # CONTEXT / GENERATION
 # =============================================================================
 
-# 210 + 2 + 210 = 422.
-#
-# 430 therefore safely holds two full weak-evidence blocks.
-# Strong direct evidence collapses to one block.
-CONTEXT_CHAR_BUDGET = 430
+# Keep the prompt small for TTFT, but preserve enough contiguous evidence
+# for Tamil/Hindi answers. Two 240-char windows + separator = <= 482 chars.
+CONTEXT_CHAR_BUDGET = 490
 MAX_CONTEXT_PARENTS = 2
-PER_CHUNK_CHARS = 210
+PER_CHUNK_CHARS = 240
 
-# Tiny extractor should not generate paragraphs.
-MAX_NEW_TOKENS = 12
+# 12 tokens is too tight for some Tamil/Hindi answers even when the visible
+# answer is only a few words. This does not materially change TTFT because
+# TTFT is dominated by prompt prefill and the first decode step.
+MAX_NEW_TOKENS = 24
+
+# Preserve one adjacent sentence on either side of the best lexical sentence.
+# This avoids throwing away the answer when a heuristic picks a nearby sentence.
+EVIDENCE_NEIGHBOR_RADIUS = 1
 
 
 # =============================================================================
@@ -797,6 +801,12 @@ def evidence_window(
     max_chars: int,
     language: str,
 ) -> str:
+    """Return a compact *contiguous* evidence window.
+
+    Important: do not collapse a retrieved chunk to a single heuristic
+    "strong" sentence. A tiny model is much more reliable when it sees the
+    answer-bearing sentence together with its immediate local context.
+    """
 
     text = " ".join(
         str(text).split()
@@ -805,44 +815,16 @@ def evidence_window(
     if not text:
         return ""
 
+    if len(text) <= max_chars:
+        return text
 
-    support = (
-        strongest_supporting_unit(
-            query,
-            text,
-            language,
-        )
-    )
-
-
-    if (
-        support.strong
-        and
-        support.unit
-    ):
-
-        if len(
-            support.unit
-        ) <= max_chars:
-
-            return support.unit.strip()
-
-
-        return _crop_window(
-            support.unit,
-            query,
-            max_chars,
-            language,
-        )
-
-
-    units = split_sentences(
-        text
-    )
-
+    units = [
+        unit.strip()
+        for unit in split_sentences(text)
+        if str(unit).strip()
+    ]
 
     if not units:
-
         return _crop_window(
             text,
             query,
@@ -850,25 +832,40 @@ def evidence_window(
             language,
         )
 
+    scores = [
+        evidence_pack_score(
+            query,
+            unit,
+            language,
+        )
+        for unit in units
+    ]
 
-    best = max(
-        units,
-
-        key=lambda unit:
-            evidence_pack_score(
-                query,
-                unit,
-                language,
-            ),
+    best_idx = max(
+        range(len(units)),
+        key=lambda idx: scores[idx],
     )
 
+    left = max(
+        0,
+        best_idx - EVIDENCE_NEIGHBOR_RADIUS,
+    )
+    right = min(
+        len(units),
+        best_idx + EVIDENCE_NEIGHBOR_RADIUS + 1,
+    )
 
-    if len(best) <= max_chars:
-        return best.strip()
+    window = " ".join(
+        units[left:right]
+    ).strip()
 
+    if len(window) <= max_chars:
+        return window
 
+    # If the local sentence window is still too large, crop within that local
+    # region rather than jumping to an unrelated head/tail sentence elsewhere.
     return _crop_window(
-        best,
+        window,
         query,
         max_chars,
         language,
@@ -1218,301 +1215,171 @@ class ContextStore:
         evidence_by_parent=None,
     ):
 
-        start = (
-            time.perf_counter()
-        )
+        start = time.perf_counter()
+        evidence_by_parent = evidence_by_parent or {}
 
+        blocks = []
+        used_evidence = []
+        used_chars = 0
 
-        evidence_by_parent = (
-            evidence_by_parent
-            or {}
-        )
-
-
-        original_rank = {
-            str(parent):
-                rank
-
-            for rank, parent
-            in enumerate(
-                parents
-            )
-        }
-
-
-        parent_best = {}
-
-
+        # IMPORTANT: preserve weighted-RRF parent order.
+        # We may choose the best child *inside* an already-retrieved parent,
+        # but we do not reorder the fused parents with a second heuristic ranker.
         for parent in parents:
 
-            parent = str(
-                parent
+            if len(blocks) >= max_parents:
+                break
+
+            parent = str(parent)
+
+            candidates = self._all_parent_candidates(
+                language,
+                parent,
+                evidence_by_parent,
             )
-
-
-            candidates = (
-                self._all_parent_candidates(
-                    language,
-                    parent,
-                    evidence_by_parent,
-                )
-            )
-
 
             if not candidates:
                 continue
 
-
-            best = max(
+            # Child selection is local to this parent only. This helps recover
+            # the answer-bearing sibling without changing frozen retrieval rank.
+            selected = max(
                 candidates,
-
-                key=lambda candidate:
-                    evidence_pack_score(
-                        query,
-                        candidate[
-                            "text"
-                        ],
-                        language,
-                    ),
-            )
-
-
-            parent_best[
-                parent
-            ] = (
-                best
-            )
-
-
-        # ---------------------------------------------------------
-        # Context packing ordering only.
-        #
-        # Fused parent ranking itself remains untouched.
-        # ---------------------------------------------------------
-
-        ordered_parents = sorted(
-            parent_best.keys(),
-
-            key=lambda parent: (
-                -evidence_pack_score(
+                key=lambda candidate: evidence_pack_score(
                     query,
-                    parent_best[
-                        parent
-                    ][
-                        "text"
-                    ],
+                    candidate["text"],
                     language,
                 ),
-
-                original_rank[
-                    parent
-                ],
-            ),
-        )
-
-
-        blocks = []
-        used_evidence = []
-        support_signals = []
-
-        used_chars = 0
-
-
-        for parent in ordered_parents:
-
-            if len(
-                blocks
-            ) >= max_parents:
-                break
-
-
-            selected = (
-                parent_best[
-                    parent
-                ]
             )
 
-
-            snippet = (
-                evidence_window(
-                    selected[
-                        "text"
-                    ],
-                    query,
-                    per_chunk_chars,
-                    language,
-                )
+            snippet = evidence_window(
+                selected["text"],
+                query,
+                per_chunk_chars,
+                language,
             )
-
 
             if not snippet:
                 continue
 
+            separator_cost = 2 if blocks else 0
+            candidate_cost = separator_cost + len(snippet)
 
-            separator_cost = (
-                2
-                if blocks
-                else 0
-            )
+            if used_chars + candidate_cost > char_budget:
+                # Do not silently skip a high-ranked parent just because the
+                # selected snippet is slightly too large. Fit it to remaining
+                # budget when enough room is available.
+                remaining = char_budget - used_chars - separator_cost
 
+                if remaining < 80:
+                    break
 
-            candidate_cost = (
-                separator_cost
-                +
-                len(snippet)
-            )
-
-
-            if (
-                used_chars
-                +
-                candidate_cost
-                >
-                char_budget
-            ):
-                continue
-
-
-            blocks.append(
-                snippet
-            )
-
-
-            used_chars += (
-                candidate_cost
-            )
-
-
-            used_evidence.append({
-                "parent_id":
-                    parent,
-
-                "chunk_id":
-                    selected.get(
-                        "chunk_id"
-                    ),
-
-                "lane":
-                    selected.get(
-                        "lane",
-                        "sibling",
-                    ),
-
-                "score":
-                    selected.get(
-                        "score"
-                    ),
-
-                "text":
-                    snippet,
-            })
-
-
-            support_signals.append(
-                strongest_supporting_unit(
+                snippet = evidence_window(
+                    selected["text"],
                     query,
-                    snippet,
+                    remaining,
                     language,
                 )
-            )
 
+                if not snippet:
+                    continue
 
-        # ---------------------------------------------------------
-        # If one packed source directly answers the query, do NOT
-        # give the 0.6B model a second distractor source.
-        # ---------------------------------------------------------
+                candidate_cost = separator_cost + len(snippet)
 
-        strong_indices = [
-            idx
+            blocks.append(snippet)
+            used_chars += candidate_cost
 
-            for idx, signal
-            in enumerate(
-                support_signals
-            )
+            used_evidence.append({
+                "parent_id": parent,
+                "chunk_id": selected.get("chunk_id"),
+                "lane": selected.get("lane", "sibling"),
+                "score": selected.get("score"),
+                "text": snippet,
+            })
 
-            if signal.strong
-        ]
-
-
-        if strong_indices:
-
-            best_idx = max(
-                strong_indices,
-
-                key=lambda idx: (
-                    support_signals[
-                        idx
-                    ].score,
-
-                    support_signals[
-                        idx
-                    ].coverage,
-                ),
-            )
-
-
-            signal = (
-                support_signals[
-                    best_idx
-                ]
-            )
-
-
-            source = dict(
-                used_evidence[
-                    best_idx
-                ]
-            )
-
-
-            source[
-                "text"
-            ] = (
-                signal.unit
-            )
-
-
-            context = (
-                signal.unit
-            )
-
-
-            used_evidence = [
-                source
-            ]
-
-
-            context_parent_count = 1
-
-
-        else:
-
-            context = "\n\n".join(
-                blocks
-            )
-
-            context_parent_count = (
-                len(blocks)
-            )
-
+        context = "\n\n".join(blocks)
 
         elapsed_ms = (
-            (
-                time.perf_counter()
-                -
-                start
-            )
-            *
-            1000
-        )
-
+            time.perf_counter() - start
+        ) * 1000
 
         return (
             context,
             elapsed_ms,
-            context_parent_count,
+            len(blocks),
             used_evidence,
         )
+
+
+# =============================================================================
+# GROUNDED ANSWER VALIDATION
+# =============================================================================
+
+def _normalize_grounding_text(text: str) -> str:
+    """Unicode/case/whitespace normalization for extractive validation."""
+
+    text = unicodedata.normalize(
+        "NFKC",
+        str(text),
+    ).casefold()
+
+    return " ".join(
+        text.split()
+    )
+
+
+def _answer_is_grounded(
+    answer: str,
+    context: str,
+) -> bool:
+    """True when the generated short answer is actually present in evidence."""
+
+    answer_norm = _normalize_grounding_text(answer)
+    context_norm = _normalize_grounding_text(context)
+
+    if not answer_norm:
+        return False
+
+    if answer_norm == "not_found":
+        return True
+
+    return answer_norm in context_norm
+
+
+def _clean_short_answer(answer: str) -> str:
+    """Remove common tiny-model wrappers without rewriting the answer."""
+
+    answer = str(answer).strip()
+
+    if not answer:
+        return ""
+
+    first_line = next(
+        (
+            line.strip()
+            for line in answer.splitlines()
+            if line.strip()
+        ),
+        "",
+    )
+
+    for prefix in (
+        "Answer:",
+        "answer:",
+        "उत्तर:",
+        "பதில்:",
+    ):
+        if first_line.startswith(prefix):
+            first_line = first_line[len(prefix):].strip()
+            break
+
+    # Avoid accidental explanations after a semicolon/pipe while preserving
+    # punctuation that can legitimately occur inside names or quantities.
+    for separator in (" | ", "; "):
+        if separator in first_line:
+            first_line = first_line.split(separator, 1)[0].strip()
+
+    return first_line
 
 
 # =============================================================================
@@ -1655,8 +1522,10 @@ class FullRAG:
         )
 
 
+        # If an unexpected prompt ever exceeds the safety cap, preserve the
+        # tail containing the question and answer cue instead of truncating it.
         self.gen_tokenizer.truncation_side = (
-            "right"
+            "left"
         )
 
 
@@ -1670,6 +1539,9 @@ class FullRAG:
 
                 device_map=
                     "cuda",
+
+                attn_implementation=
+                    "sdpa",
             )
         )
 
@@ -2147,313 +2019,166 @@ class FullRAG:
         language="ta",
     ):
 
-        stage_start = (
-            time.perf_counter()
+        stage_start = time.perf_counter()
+
+        if not str(context).strip():
+            return {
+                "answer": "NOT_FOUND",
+                "raw_answer": "NOT_FOUND",
+                "grounded": True,
+                "strong_evidence": False,
+                "support_score": 0.0,
+                "support_coverage": 0.0,
+                "support_unit": "",
+                "prompt_tokens": 0,
+                "prompt_context_chars": 0,
+                "prompt_prep_ms": 0.0,
+                "model_first_token_ms": 0.0,
+                "generation_stage_ttft_ms": 0.0,
+                "generation_complete_ms": 0.0,
+                "first_token_at": None,
+                "completed_at": None,
+                "generated_tokens": 0,
+                "possibly_truncated": False,
+            }
+
+        # Keep this signal for telemetry only. Never tell the model that a
+        # heuristic has "verified" the answer.
+        support = strongest_supporting_unit(
+            query,
+            context,
+            language,
         )
 
-
-        support = (
-            strongest_supporting_unit(
-                query,
-                context,
-                language,
-            )
+        # Deliberately short: tiny models follow compact extraction prompts more
+        # reliably, and fewer prompt tokens improve prefill/TTFT.
+        system_content = (
+            "Extract the answer from Evidence only. "
+            "Copy the shortest exact span that answers Question. "
+            "Output that span only. "
+            "If absent, output exactly NOT_FOUND. "
+            "Do not use outside knowledge."
         )
-
-
-        strong_evidence = (
-            support.strong
-        )
-
-
-        # ---------------------------------------------------------
-        # The 0.6B model gets a much smaller job.
-        # ---------------------------------------------------------
-
-        if strong_evidence:
-
-            system_content = (
-                "Copy ONLY the shortest answer span from Evidence. "
-                "Evidence has been verified to directly answer Question. "
-                "Return 1-5 words only. "
-                "No explanation. "
-                "Do not repeat Question. "
-                "Do not choose a distractor from a list."
-            )
-
-
-        else:
-
-            system_content = (
-                "Copy ONLY a directly supported answer from Evidence. "
-                "Return 1-5 words. "
-                "If Evidence is about a different subject/country, "
-                "contradicts Question, or does not directly answer it, "
-                "output exactly NOT_FOUND. "
-                "Do not guess."
-            )
-
 
         messages = [
             {
-                "role":
-                    "system",
-
-                "content":
-                    system_content,
+                "role": "system",
+                "content": system_content,
             },
-
             {
-                "role":
-                    "user",
-
-                "content":
-                    (
-                        f"Question:\n"
-                        f"{query}\n\n"
-                        f"Evidence:\n"
-                        f"{context}\n\n"
-                        "Answer:"
-                    ),
+                "role": "user",
+                "content": (
+                    f"Evidence:\n{context}\n\n"
+                    f"Question:\n{query}\n\n"
+                    "Answer:"
+                ),
             },
         ]
 
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
 
-        prompt = (
-            self.gen_tokenizer
-            .apply_chat_template(
-                messages,
+        # Qwen3 supports hard non-thinking mode. Keep the engine configurable
+        # so another generator can be benchmarked without rewriting this file.
+        if "qwen3" in GEN_MODEL.casefold():
+            template_kwargs["enable_thinking"] = False
 
-                tokenize=False,
-
-                add_generation_prompt=
-                    True,
-
-                enable_thinking=
-                    False,
-            )
+        prompt = self.gen_tokenizer.apply_chat_template(
+            messages,
+            **template_kwargs,
         )
 
-
-        inputs = (
-            self.gen_tokenizer(
-                prompt,
-
-                return_tensors=
-                    "pt",
-
-                truncation=
-                    True,
-
-                max_length=
-                    1024,
-            )
-            .to(
-                "cuda"
-            )
-        )
-
+        inputs = self.gen_tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=2048,
+        ).to("cuda")
 
         prompt_tokens = int(
-            inputs[
-                "input_ids"
-            ].shape[1]
+            inputs["input_ids"].shape[1]
         )
-
 
         prep_ms = (
-            (
-                time.perf_counter()
-                -
-                stage_start
-            )
-            *
-            1000
+            time.perf_counter() - stage_start
+        ) * 1000
+
+        streamer = FirstTokenStreamer(
+            self.gen_tokenizer
         )
-
-
-        streamer = (
-            FirstTokenStreamer(
-                self.gen_tokenizer
-            )
-        )
-
 
         kwargs = {
             **inputs,
-
-            "streamer":
-                streamer,
-
-            "max_new_tokens":
-                max_new_tokens,
-
-            "do_sample":
-                False,
-
-            "use_cache":
-                True,
-
-            "pad_token_id":
-                self.gen_tokenizer
-                .eos_token_id,
+            "streamer": streamer,
+            "max_new_tokens": max_new_tokens,
+            "do_sample": False,
+            "use_cache": True,
+            "pad_token_id": self.gen_tokenizer.eos_token_id,
         }
 
-
         torch.cuda.synchronize()
+        model_start = time.perf_counter()
 
-
-        model_start = (
-            time.perf_counter()
+        # No Python worker thread here: this function returns only after the
+        # answer is complete, so a worker adds overhead without making the first
+        # token user-visible. The streamer still timestamps token #1 precisely.
+        self.generator.generate(
+            **kwargs
         )
 
-
-        worker = threading.Thread(
-            target=
-                self.generator.generate,
-
-            kwargs=
-                kwargs,
-
-            daemon=
-                True,
-        )
-
-
-        worker.start()
-
-
-        streamer.done.wait(
-            timeout=60
-        )
-
-
-        worker.join()
-
-
-        if (
-            streamer.first_token_at
-            is None
-        ):
-
+        if streamer.first_token_at is None:
             raise RuntimeError(
                 "No generated token received"
             )
 
-
-        raw_answer = (
-            self.gen_tokenizer.decode(
-                streamer.generated_ids,
-
-                skip_special_tokens=
-                    True,
-            )
+        raw_answer = self.gen_tokenizer.decode(
+            streamer.generated_ids,
+            skip_special_tokens=True,
         ).strip()
 
-
-        lines = [
-            line.strip()
-
-            for line
-            in raw_answer.splitlines()
-
-            if line.strip()
-        ]
-
-
-        answer = (
-            lines[0]
-            if lines
-            else ""
+        answer = _clean_short_answer(
+            raw_answer
         )
 
+        grounded = _answer_is_grounded(
+            answer,
+            context,
+        )
+
+        # Fail closed on hallucinations. For an extractive benchmark it is
+        # better to abstain than return a confident answer absent from evidence.
+        if not grounded:
+            answer = "NOT_FOUND"
 
         first_token_ms = (
-            (
-                streamer.first_token_at
-                -
-                model_start
-            )
-            *
-            1000
-        )
-
+            streamer.first_token_at - model_start
+        ) * 1000
 
         complete_ms = (
-            (
-                streamer.completed_at
-                -
-                model_start
-            )
-            *
-            1000
-        )
-
+            streamer.completed_at - model_start
+        ) * 1000
 
         return {
-            "answer":
-                answer,
-
-            "raw_answer":
-                raw_answer,
-
-            "strong_evidence":
-                strong_evidence,
-
-            "support_score":
-                support.score,
-
-            "support_coverage":
-                support.coverage,
-
-            "support_unit":
-                support.unit,
-
-            "prompt_tokens":
-                prompt_tokens,
-
-            "prompt_context_chars":
-                len(
-                    context
-                ),
-
-            "prompt_prep_ms":
-                prep_ms,
-
-            "model_first_token_ms":
-                first_token_ms,
-
-            "generation_stage_ttft_ms":
-                prep_ms
-                +
-                first_token_ms,
-
-            "generation_complete_ms":
-                prep_ms
-                +
-                complete_ms,
-
-            "first_token_at":
-                streamer.first_token_at,
-
-            "completed_at":
-                streamer.completed_at,
-
-            "generated_tokens":
-                len(
-                    streamer.generated_ids
-                ),
-
-            # TELEMETRY ONLY.
-            #
-            # guardrails.py no longer automatically rejects a grounded
-            # answer just because this is True.
+            "answer": answer,
+            "raw_answer": raw_answer,
+            "grounded": grounded,
+            "strong_evidence": bool(support.strong),
+            "support_score": support.score,
+            "support_coverage": support.coverage,
+            "support_unit": support.unit,
+            "prompt_tokens": prompt_tokens,
+            "prompt_context_chars": len(context),
+            "prompt_prep_ms": prep_ms,
+            "model_first_token_ms": first_token_ms,
+            "generation_stage_ttft_ms": prep_ms + first_token_ms,
+            "generation_complete_ms": prep_ms + complete_ms,
+            "first_token_at": streamer.first_token_at,
+            "completed_at": streamer.completed_at,
+            "generated_tokens": len(streamer.generated_ids),
             "possibly_truncated": (
-                len(
-                    streamer.generated_ids
-                )
-                >=
-                max_new_tokens
+                len(streamer.generated_ids) >= max_new_tokens
             ),
         }
 
