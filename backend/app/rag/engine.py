@@ -188,13 +188,14 @@ HNSW_EF = 64
 # FROZEN CONTEXT & GENERATION CONFIG (LATENCY WINNER)
 # =============================================================================
 
-CONTEXT_CHAR_BUDGET = 450
-MAX_CONTEXT_PARENTS = 2
+CONTEXT_CHAR_BUDGET = 750
+MAX_CONTEXT_PARENTS = 3
 
-# Two 220-character evidence blocks fit inside the 450-char budget:
-# 220 + "\n\n" + 220 = 442 chars. Snapped to word boundaries to prevent
-# broken letter artifacts. Provides 2-source coverage for complex questions.
-PER_CHUNK_CHARS = 220
+# Three 250-character evidence blocks fit inside the 750-char budget:
+# 250 + "\n\n" + 250 + "\n\n" + 250 = 754 chars.  Snapped to word boundaries
+# to prevent broken letter artifacts.  3-source coverage means the correct
+# passage reaches the generator even when 1–2 top-ranked parents are noise.
+PER_CHUNK_CHARS = 250
 
 # 40 tokens gives headroom for longer answer entities like
 # "प्रशांत महासागर", "1947 ஆகஸ்ட் 15", "கார்பன் டை ஆக்சைடு"
@@ -1611,6 +1612,7 @@ class FullRAG:
         }
 
 
+
     # =========================================================================
     # GENERATE
     # =========================================================================
@@ -1630,24 +1632,29 @@ class FullRAG:
             {
                 "role": "system",
                 "content": (
-                    "You are a fact extractor. "
-                    "Find the specific name, number, or value in C that directly answers Q. "
-                    "Output ONLY that extracted word or phrase — never repeat words from Q. "
-                    "If C has no relevant information at all, output NOT_FOUND."
+                    "Extract the answer to Q from C. "
+                    "Output only the answer word or phrase.\n\n"
+                    "Q: भारत की राजधानी क्या है?\n"
+                    "C: नई दिल्ली भारत की राजधानी है।\n"
+                    "Answer: नई दिल्ली\n\n"
+                    "Q: தமிழ்நாட்டின் தலைநகரம் எது?\n"
+                    "C: சென்னை தமிழ்நாட்டின் தலைநகரமாகும்.\n"
+                    "Answer: சென்னை\n\n"
+                    "If C has no relevant information, output NOT_FOUND."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Q:\n{query}\n\n"
-                    f"C:\n{context}"
+                    f"Q: {query}\n"
+                    f"C: {context}"
                 ),
             },
         ]
 
         # apply_chat_template adds <|im_start|>assistant\n — we then
-        # immediately prefix "Answer:" so the model completes from that
-        # cue rather than generating conversationally.
+        # immediately prefix "Answer: " so the model completes from that
+        # cue, matching the few-shot pattern exactly.
         prompt = (
             self.gen_tokenizer
             .apply_chat_template(
@@ -1659,7 +1666,7 @@ class FullRAG:
 
                 enable_thinking=False,
             )
-            + "Answer:"
+            + "Answer: "
         )
 
 
@@ -1674,7 +1681,7 @@ class FullRAG:
                     True,
 
                 max_length=
-                    850,
+                    1024,
             )
             .to("cuda")
         )
@@ -1684,7 +1691,7 @@ class FullRAG:
             inputs["input_ids"].shape[1]
         )
 
-        if prompt_tokens >= 800:
+        if prompt_tokens >= 950:
             print(
                 f"⚠️ Prompt near truncation: "
                 f"{prompt_tokens} tokens"
@@ -1706,6 +1713,20 @@ class FullRAG:
         )
 
 
+        # Resolve newline token ID for use as a stop token.
+        # The few-shot examples show one-line answers, so the model
+        # naturally emits \n after the entity.  Treating \n as EOS
+        # ensures it stops immediately after the answer span.
+        newline_ids = self.gen_tokenizer.encode(
+            "\n", add_special_tokens=False
+        )
+
+        stop_ids = [
+            self.gen_tokenizer.eos_token_id,
+        ]
+        if newline_ids:
+            stop_ids.append(newline_ids[0])
+
         kwargs = {
             **inputs,
 
@@ -1720,6 +1741,16 @@ class FullRAG:
 
             "use_cache":
                 True,
+
+            "eos_token_id":
+                stop_ids,
+
+            # Discourage verbatim copying of long context sequences.
+            # Value > 1.0 penalises tokens that already appeared in
+            # the input, steering the model toward novel entity words
+            # rather than echoing the evidence passage.
+            "repetition_penalty":
+                1.3,
         }
 
 
@@ -1761,7 +1792,7 @@ class FullRAG:
             )
 
 
-        answer = (
+        raw_answer = (
             self.gen_tokenizer.decode(
                 streamer.generated_ids,
 
@@ -1769,6 +1800,11 @@ class FullRAG:
                     True,
             )
         )
+
+        # Take first line only — the few-shot pattern teaches the
+        # model that the answer is a single line after "Answer: ".
+        answer = raw_answer.split("\n")[0].strip()
+
 
 
         first_token_ms = (
