@@ -266,7 +266,15 @@ def apply_output_guardrail(
             )
 
     query_terms = set(_terms(query))
-    if answer_terms and set(answer_terms).issubset(query_terms):
+    # Only fire question_echo when the answer adds NO new meaningful term.
+    # A "meaningful new term" is any answer word >= 4 chars NOT already in the query.
+    # This prevents blocking valid specific entities (e.g. "மயில்", "प्रशांत", "சந்திரன்")
+    # while still catching pure echoes like answering "பறவை" to a "பறவை" question.
+    meaningful_new = [
+        t for t in answer_terms
+        if t not in query_terms and len(t) >= 4
+    ]
+    if answer_terms and not meaningful_new and set(answer_terms).issubset(query_terms):
         return _localized_rejection(
             language,
             "question_echo",

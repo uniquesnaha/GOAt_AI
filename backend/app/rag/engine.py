@@ -196,8 +196,9 @@ MAX_CONTEXT_PARENTS = 2
 # broken letter artifacts. Provides 2-source coverage for complex questions.
 PER_CHUNK_CHARS = 220
 
-# 32 tokens ensures full answers are generated without truncation.
-MAX_NEW_TOKENS = 32
+# 40 tokens gives headroom for longer answer entities like
+# "प्रशांत महासागर", "1947 ஆகஸ்ட் 15", "கார்பன் டை ஆக்சைடு"
+MAX_NEW_TOKENS = 40
 
 
 
@@ -594,6 +595,8 @@ def evidence_window(
     """
     Return the ~max_chars character region of `text` that covers the most
     query terms, snapped to complete word boundaries.
+    Interrogatives and superlatives are downweighted so the window centres
+    on content/entity terms rather than question-type words.
     Does NOT alter retrieval ranking.
     """
 
@@ -602,11 +605,30 @@ def evidence_window(
     if len(text) <= max_chars:
         return text
 
+    # Interrogatives/superlatives carry no positional signal — they appear
+    # in both query and all passages.  Downweight them so the best window
+    # centres on noun/entity terms instead.
+    _FILLER_TERMS: set[str] = {
+        # Tamil interrogatives & superlatives
+        "எது", "என்ன", "எந்த", "எத்தனை", "யார்", "எங்கே",
+        "உள்ளது", "ஆகும்", "மிக", "மிகவும்", "ஒரே",
+        # Hindi interrogatives & superlatives
+        "क्या", "कौन", "कौनसा", "कहाँ", "कैसे",
+        "है", "हैं", "सबसे", "सबसेबड़ा", "सबसेछोटा",
+        "सबसेलंबा", "सबसेतेज", "सबसेलम्बी",
+    }
+
     query_terms = [
         term
         for term in word_splitter(query)
         if len(term) >= 2
     ]
+
+    # Assign each query term a weight: filler/interrogative = 0.2, else 1.0
+    term_weights = {
+        term: (0.2 if term.casefold() in _FILLER_TERMS else 1.0)
+        for term in query_terms
+    }
 
     def _snap_to_words(raw_start: int, raw_end: int) -> str:
         # Snap start forward to word boundary if slicing mid-word
@@ -640,10 +662,8 @@ def evidence_window(
     if not positions:
         return _snap_to_words(0, max_chars)
 
-    query_set = set(query_terms)
-
     best_window = None
-    best_score = -1
+    best_score = -1.0
 
     for position in positions:
         raw_start = max(
@@ -662,7 +682,12 @@ def evidence_window(
             word_splitter(window)
         )
 
-        score = len(query_set & window_terms)
+        # Weighted coverage: entity terms count fully, fillers count 0.2
+        score = sum(
+            weight
+            for term, weight in term_weights.items()
+            if term.casefold() in {t.casefold() for t in window_terms}
+        )
 
         if score > best_score:
             best_score = score
@@ -1605,22 +1630,24 @@ class FullRAG:
             {
                 "role": "system",
                 "content": (
-                    "Extract the factual answer to Q from the context C. "
-                    "Output only the short answer in the language of Q. "
-                    "If C has completely no related information, output NOT_FOUND."
+                    "You are a fact extractor. "
+                    "Find the specific name, number, or value in C that directly answers Q. "
+                    "Output ONLY that extracted word or phrase — never repeat words from Q. "
+                    "If C has no relevant information at all, output NOT_FOUND."
                 ),
             },
             {
                 "role": "user",
                 "content": (
                     f"Q:\n{query}\n\n"
-                    f"C:\n{context}\n\n"
-                    "A:"
+                    f"C:\n{context}"
                 ),
             },
         ]
 
-
+        # apply_chat_template adds <|im_start|>assistant\n — we then
+        # immediately prefix "Answer:" so the model completes from that
+        # cue rather than generating conversationally.
         prompt = (
             self.gen_tokenizer
             .apply_chat_template(
@@ -1632,7 +1659,9 @@ class FullRAG:
 
                 enable_thinking=False,
             )
+            + "Answer:"
         )
+
 
         inputs = (
             self.gen_tokenizer(

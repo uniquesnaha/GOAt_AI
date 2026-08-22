@@ -11,14 +11,22 @@ import unicodedata
 
 QUESTION_WORDS = {
     "ta": {
+        # interrogatives
         "எது", "என்ன", "எந்த", "எத்தனை", "யார்", "எங்கே", "எப்படி",
         "உள்ளது", "அமைந்துள்ளது", "ஆகும்",
+        # superlatives / quantifiers (no retrieval signal when in query)
+        "மிக", "மிகவும்", "ஒரே", "முதல்",
     },
     "hi": {
+        # interrogatives
         "क्या", "कौन", "कौनसा", "कौनसी", "कितना", "कितने", "कितनी",
         "कहाँ", "कैसे", "है", "हैं", "होता", "होती", "स्थित",
+        # superlatives / quantifiers (no retrieval signal when in query)
+        "सबसे", "सबसेबड़ा", "सबसेछोटा", "सबसेलंबा", "सबसेतेज",
+        "सबसेबड़ी", "सबसेछोटी", "सबसेलम्बी",
     },
 }
+
 
 
 def split_terms(text: str) -> list[str]:
