@@ -1,17 +1,35 @@
 """
-Cheap deterministic evidence-quality utilities.
+Deterministic evidence quality, support validation and answer-span extraction.
 
-IMPORTANT:
-- Does NOT modify dense retrieval.
-- Does NOT modify BM25 retrieval.
-- Does NOT modify weighted RRF.
-- Does NOT invoke another model.
+This module NEVER changes:
+- dense retrieval
+- BM25 retrieval
+- RRF fusion
+- fused Top-20 ranking
 
-Its job is only to:
-1. rank already-retrieved evidence for prompt packing,
-2. isolate the best sentence/list item,
-3. identify when evidence is strong enough that a tiny generator
-   should be told to extract rather than abstain.
+It operates only on evidence that was already retrieved.
+
+Goals:
+1. Reject wrong-subject evidence.
+   Example:
+       Q: India's national bird?
+       E: Kiwi is New Zealand's national bird.
+       -> NOT strong evidence.
+
+2. Reject contradictions.
+   Example:
+       Q: largest planet?
+       E: Saturn is the second largest planet.
+       -> NOT strong evidence.
+
+3. Detect direct support even with Tamil/Hindi morphology.
+
+4. Split numbered lists correctly.
+
+5. Produce a high-confidence grounded answer candidate when the
+   evidence structure makes the answer explicit.
+
+No model call is made here.
 """
 
 from __future__ import annotations
@@ -22,17 +40,9 @@ from dataclasses import dataclass
 
 
 # =============================================================================
-# QUESTION / RELATION WORDS
+# LOW-INFORMATION QUESTION WORDS
 # =============================================================================
 
-# Only low-information interrogatives / generic relation words belong here.
-#
-# IMPORTANT:
-# Semantic modifiers such as:
-#   Tamil: ஒரே, மிக, தேசிய
-#   Hindi: सबसे, एकमात्र, राष्ट्रीय
-#
-# MUST NOT be removed. They can change the factual answer.
 QUESTION_WORDS = {
     "ta": {
         "எது",
@@ -43,12 +53,13 @@ QUESTION_WORDS = {
         "எங்கே",
         "எப்படி",
         "உள்ளது",
-        "அமைந்துள்ளது",
         "ஆகும்",
         "என்பது",
+        "அமைந்துள்ளது",
+        "அழைக்கப்படுகிறது",
+        "அழைக்கப்படும்",
         "செய்யும்",
         "செய்கிறது",
-        "செய்கிற",
         "பயன்படுத்தும்",
         "பயன்படுத்துகிறது",
         "கொண்டுள்ளது",
@@ -69,79 +80,177 @@ QUESTION_WORDS = {
         "होता",
         "होती",
         "होते",
+        "स्थित",
+        "कहा",
+        "जाता",
+        "जाती",
+        "जाते",
         "करता",
         "करती",
         "करते",
         "करने",
-        "स्थित",
-        "इस्तेमाल",
         "उपयोग",
+        "इस्तेमाल",
     },
 }
 
 
 # =============================================================================
-# HARD QUERY CONSTRAINTS
+# QUERY CONSTRAINT MARKERS
 # =============================================================================
 
-# These are not domain answers.
-# They are generic linguistic/unit constraints.
-#
-# If a user explicitly asks for Celsius, an evidence sentence containing
-# only Fahrenheit must NOT be classified as "strong support".
-#
-# Similarly:
-#   national bird != merely a bird
-#   only satellite != merely a satellite
-HARD_CONSTRAINT_GROUPS = {
+MANDATORY_MARKERS = {
     "ta": (
         (
-            "செல்சியஸ்",
-            "celsius",
-            "°c",
+            ("தேசிய",),
+            ("தேசிய",),
         ),
         (
-            "ஃபாரன்ஹீட்",
-            "பாரன்ஹீட்",
-            "fahrenheit",
-            "°f",
+            ("தலைநகர",),
+            ("தலைநகர",),
         ),
         (
-            "தேசிய",
+            ("ஜனாதிபதி", "குடியரசுத் தலைவர்"),
+            ("ஜனாதிபதி", "குடியரசுத் தலைவர்"),
         ),
         (
-            "ஒரே",
-            "மட்டுமே",
+            ("சிவப்பு",),
+            ("சிவப்பு",),
         ),
         (
-            "மிக",
-            "மிகவும்",
+            ("செல்சியஸ்", "°c"),
+            ("செல்சியஸ்", "°c"),
+        ),
+        (
+            ("ஃபாரன்ஹீட்", "பாரன்ஹீட்", "°f"),
+            ("ஃபாரன்ஹீட்", "பாரன்ஹீட்", "°f"),
+        ),
+        (
+            ("இயற்கை",),
+            ("இயற்கை",),
+        ),
+        (
+            ("துணைக்கோள்",),
+            ("துணைக்கோள்",),
         ),
     ),
 
     "hi": (
         (
-            "सेल्सियस",
-            "celsius",
-            "°c",
+            ("राष्ट्रीय",),
+            ("राष्ट्रीय",),
         ),
         (
-            "फ़ारेनहाइट",
-            "फारेनहाइट",
-            "fahrenheit",
-            "°f",
+            ("राजधानी",),
+            ("राजधानी",),
         ),
         (
-            "राष्ट्रीय",
+            ("राष्ट्रपति",),
+            ("राष्ट्रपति",),
         ),
         (
-            "एकमात्र",
-            "केवल",
-            "सिर्फ",
+            ("लाल",),
+            ("लाल",),
         ),
         (
-            "सबसे",
+            ("सेल्सियस", "°c"),
+            ("सेल्सियस", "°c"),
         ),
+        (
+            ("फ़ारेनहाइट", "फारेनहाइट", "°f"),
+            ("फ़ारेनहाइट", "फारेनहाइट", "°f"),
+        ),
+        (
+            ("प्राकृतिक",),
+            ("प्राकृतिक",),
+        ),
+        (
+            ("उपग्रह",),
+            ("उपग्रह",),
+        ),
+    ),
+}
+
+
+ONLY_QUERY_MARKERS = {
+    "ta": (
+        "ஒரே",
+        "மட்டுமே",
+    ),
+
+    "hi": (
+        "एकमात्र",
+        "केवल",
+        "सिर्फ",
+    ),
+}
+
+
+ONLY_EVIDENCE_MARKERS = {
+    "ta": (
+        "ஒரே",
+        "மட்டுமே",
+        "ஒரு",
+        "ஒன்று",
+        "1 ",
+        "1.",
+    ),
+
+    "hi": (
+        "एकमात्र",
+        "केवल",
+        "सिर्फ",
+        "एक ",
+        "एक ही",
+        "1 ",
+        "1.",
+    ),
+}
+
+
+SUPERLATIVE_MARKERS = {
+    "ta": (
+        "மிகப்பெரிய",
+        "மிக பெரிய",
+        "மிக நீளமான",
+        "மிக உயரமான",
+        "மிக ஆழமான",
+        "மிக வேகமான",
+    ),
+
+    "hi": (
+        "सबसे बड़ा",
+        "सबसे बड़ी",
+        "सबसे बड़े",
+        "सबसे लंबा",
+        "सबसे लम्बा",
+        "सबसे ऊंचा",
+        "सबसे ऊँचा",
+        "सबसे गहरा",
+        "सबसे तेज",
+    ),
+}
+
+
+ORDINAL_CONTRADICTIONS = {
+    "ta": (
+        "இரண்டாவது",
+        "இரண்டாம்",
+        "மூன்றாவது",
+        "மூன்றாம்",
+        "நான்காவது",
+    ),
+
+    "hi": (
+        "दूसरा",
+        "दूसरी",
+        "दूसरे",
+        "द्वितीय",
+        "तीसरा",
+        "तीसरी",
+        "तीसरे",
+        "चौथा",
+        "चौथी",
     ),
 }
 
@@ -151,20 +260,25 @@ HARD_CONSTRAINT_GROUPS = {
 # =============================================================================
 
 _LIST_ITEM_RE = re.compile(
-    r"^\s*(?:\d{1,2}|[A-Da-d])[\.\)]\s+"
+    r"^\s*(?:\d{1,2}|[A-Da-d])[\.\)]\s*"
+)
+
+_LIST_HEAD_RE = re.compile(
+    r"^\s*(?:\d{1,2}|[A-Da-d])[\.\)]\s*"
+    r"([^:;\-–—,.।]{1,60}?)\s*[\-–—:]"
 )
 
 _LIST_BOUNDARY_RE = re.compile(
     r"\s+(?=(?:\d{1,2}|[A-Da-d])[\.\)]\s+)"
 )
 
-_NORMAL_SENTENCE_SPLIT_RE = re.compile(
+_SENTENCE_SPLIT_RE = re.compile(
     r"(?<=[?!।])\s+|(?<=\.)\s+"
 )
 
 
 # =============================================================================
-# TYPES
+# DATA TYPES
 # =============================================================================
 
 @dataclass(frozen=True, slots=True)
@@ -174,137 +288,219 @@ class SupportSignal:
     coverage: float
     matched_terms: int
     total_terms: int
-    sentence: str
-    list_item: bool
+    unit: str
+    anchors_ok: bool
+    constraints_ok: bool
+    contradiction: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerCandidate:
+    text: str
+    confidence: float
+    method: str
 
 
 # =============================================================================
 # TOKENIZATION
 # =============================================================================
 
-def split_terms(
-    text: str,
-) -> list[str]:
-    """
-    Unicode-aware tokenizer suitable for Tamil / Hindi.
-
-    Keeps letters, combining marks and digits together.
-    """
-
+def split_terms(text: str) -> list[str]:
     terms: list[str] = []
     current: list[str] = []
 
     for char in str(text).casefold():
+        category = unicodedata.category(char)
 
-        category = unicodedata.category(
-            char
-        )
-
-        if (
-            category
-            and
-            category[0] in {
-                "L",
-                "M",
-                "N",
-            }
-        ):
+        if category and category[0] in {"L", "M", "N"}:
             current.append(char)
 
         elif current:
-
-            terms.append(
-                "".join(current)
-            )
-
+            terms.append("".join(current))
             current = []
 
     if current:
-
-        terms.append(
-            "".join(current)
-        )
+        terms.append("".join(current))
 
     return terms
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    result = []
+    seen = set()
+
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+
+    return result
 
 
 def informative_query_terms(
     query: str,
     language: str,
 ) -> list[str]:
-    """
-    Remove only low-information question/relation words.
-    """
 
     stopwords = QUESTION_WORDS.get(
         language,
         set(),
     )
 
-    return [
+    terms = [
         term
         for term in split_terms(query)
-        if (
-            len(term) >= 2
-            and
-            term not in stopwords
-        )
+        if len(term) >= 2
+        and term not in stopwords
     ]
+
+    return _dedupe(terms)
 
 
 # =============================================================================
 # FUZZY MORPHOLOGICAL MATCHING
 # =============================================================================
 
-def term_matches(
-    left: str,
-    right: str,
-) -> bool:
-    """
-    Very cheap morphology-tolerant match.
-
-    Exact match first.
-
-    For words >=4 chars, allow containment:
-        பூமி      ↔ பூமியின்
-        மனித     ↔ மனிதர்கள்
-
-    This is intentionally conservative.
-    """
-
+def term_matches(left: str, right: str) -> bool:
     left = str(left).casefold()
     right = str(right).casefold()
 
     if left == right:
         return True
 
-    if (
-        min(
-            len(left),
-            len(right),
-        )
-        >= 4
-    ):
+    if min(len(left), len(right)) >= 4:
         return (
             left in right
-            or
-            right in left
+            or right in left
         )
 
     return False
 
+
+def _term_present(
+    term: str,
+    text_terms: list[str],
+) -> bool:
+
+    return any(
+        term_matches(
+            term,
+            candidate,
+        )
+        for candidate in text_terms
+    )
+
+
+# =============================================================================
+# REQUIRED SUBJECT ANCHORS
+# =============================================================================
+
+def required_anchor_terms(
+    query: str,
+    language: str,
+) -> list[str]:
+    """
+    Extract high-value subject anchors from possessive question forms.
+
+    Hindi examples:
+        भारत का राष्ट्रीय पक्षी...
+            -> भारत
+
+        मानव शरीर का सबसे बड़ा अंग...
+            -> मानव, शरीर
+
+        पृथ्वी का एकमात्र प्राकृतिक उपग्रह...
+            -> पृथ्वी
+
+    Tamil examples:
+        இந்தியாவின் தேசியப் பறவை...
+            -> இந்தியாவின்
+
+        பூமியின் ஒரே இயற்கை துணைக்கோள்...
+            -> பூமியின்
+
+        தமிழ்நாட்டின் தலைநகரம்...
+            -> தமிழ்நாட்டின்
+    """
+
+    if language == "hi":
+
+        match = re.match(
+            r"^\s*(.{1,80}?)\s+(?:का|की|के)\b",
+            str(query),
+        )
+
+        if not match:
+            return []
+
+        terms = [
+            t
+            for t in split_terms(
+                match.group(1)
+            )
+            if len(t) >= 2
+        ]
+
+        return _dedupe(terms)
+
+
+    if language == "ta":
+
+        terms = split_terms(query)
+
+        suffixes = (
+            "வின்",
+            "யின்",
+            "த்தின்",
+            "ட்டின்",
+            "னின்",
+        )
+
+        for term in terms[:3]:
+
+            if term.endswith(suffixes):
+                return [term]
+
+        return []
+
+
+    return []
+
+
+def anchors_satisfied(
+    query: str,
+    text: str,
+    language: str,
+) -> bool:
+
+    anchors = required_anchor_terms(
+        query,
+        language,
+    )
+
+    if not anchors:
+        return True
+
+    text_terms = split_terms(text)
+
+    return all(
+        _term_present(
+            anchor,
+            text_terms,
+        )
+        for anchor in anchors
+    )
+
+
+# =============================================================================
+# QUERY TERM COVERAGE
+# =============================================================================
 
 def query_overlap_stats(
     query: str,
     text: str,
     language: str,
 ) -> tuple[int, int, float]:
-    """
-    Return:
-        matched informative query terms,
-        total informative query terms,
-        coverage ratio
-    """
 
     query_terms = informative_query_terms(
         query,
@@ -314,39 +510,28 @@ def query_overlap_stats(
     if not query_terms:
         return 0, 0, 0.0
 
-    text_terms = split_terms(
-        text
+    text_terms = split_terms(text)
+
+    matched = sum(
+        1
+        for query_term in query_terms
+        if _term_present(
+            query_term,
+            text_terms,
+        )
     )
 
-    matched = 0
-
-    for query_term in query_terms:
-
-        if any(
-            term_matches(
-                query_term,
-                text_term,
-            )
-            for text_term
-            in text_terms
-        ):
-            matched += 1
-
-    coverage = (
-        matched
-        /
-        len(query_terms)
-    )
+    total = len(query_terms)
 
     return (
         matched,
-        len(query_terms),
-        coverage,
+        total,
+        matched / total,
     )
 
 
 # =============================================================================
-# HARD CONSTRAINT CHECK
+# HARD CONSTRAINTS
 # =============================================================================
 
 def hard_constraints_satisfied(
@@ -354,60 +539,57 @@ def hard_constraints_satisfied(
     text: str,
     language: str,
 ) -> bool:
-    """
-    Ensure explicit high-value constraints in the question are not lost.
 
-    Examples:
-        Question asks Celsius
-        Evidence only says Fahrenheit
-        -> False
+    query_cf = str(query).casefold()
+    text_cf = str(text).casefold()
 
-        Question asks national bird
-        Evidence merely describes a bird
-        -> False
-
-        Question asks ONLY natural satellite
-        Evidence merely mentions a planet
-        -> False
-    """
-
-    query_cf = str(
-        query
-    ).casefold()
-
-    text_cf = str(
-        text
-    ).casefold()
-
-    groups = HARD_CONSTRAINT_GROUPS.get(
+    for (
+        query_markers,
+        evidence_markers,
+    ) in MANDATORY_MARKERS.get(
         language,
         (),
-    )
+    ):
 
-    for group in groups:
-
-        query_mentions_group = any(
-            marker.casefold()
-            in query_cf
-            for marker
-            in group
+        requested = any(
+            marker.casefold() in query_cf
+            for marker in query_markers
         )
 
-        if not query_mentions_group:
+        if not requested:
             continue
 
-        text_mentions_group = any(
-            marker.casefold()
-            in text_cf
-            for marker
-            in group
+        found = any(
+            marker.casefold() in text_cf
+            for marker in evidence_markers
         )
 
-        if not text_mentions_group:
+        if not found:
             return False
 
-    # Explicit numeric conditions in the question should also appear
-    # in the supporting sentence.
+
+    only_requested = any(
+        marker.casefold() in query_cf
+        for marker in ONLY_QUERY_MARKERS.get(
+            language,
+            (),
+        )
+    )
+
+    if only_requested:
+
+        only_supported = any(
+            marker.casefold() in text_cf
+            for marker in ONLY_EVIDENCE_MARKERS.get(
+                language,
+                (),
+            )
+        )
+
+        if not only_supported:
+            return False
+
+
     query_digits = set(
         re.findall(
             r"\d+",
@@ -429,40 +611,49 @@ def hard_constraints_satisfied(
         ):
             return False
 
+
     return True
 
 
-# =============================================================================
-# PASSAGE RELEVANCE
-# =============================================================================
-
-def evidence_relevance_score(
+def has_query_contradiction(
     query: str,
     text: str,
     language: str,
-) -> float:
-    """
-    Cheap informative query coverage from 0..1.
-    """
+) -> bool:
 
-    _, _, coverage = (
-        query_overlap_stats(
-            query,
-            text,
+    query_cf = str(query).casefold()
+    text_cf = str(text).casefold()
+
+    asks_superlative = any(
+        marker.casefold() in query_cf
+        for marker in SUPERLATIVE_MARKERS.get(
             language,
+            (),
         )
     )
 
-    return coverage
+    if asks_superlative:
+
+        has_ordinal = any(
+            marker.casefold() in text_cf
+            for marker in ORDINAL_CONTRADICTIONS.get(
+                language,
+                (),
+            )
+        )
+
+        if has_ordinal:
+            return True
+
+
+    return False
 
 
 # =============================================================================
 # SENTENCE / LIST SPLITTING
 # =============================================================================
 
-def is_list_item(
-    text: str,
-) -> bool:
+def is_list_item(text: str) -> bool:
     return bool(
         _LIST_ITEM_RE.match(
             str(text)
@@ -470,39 +661,20 @@ def is_list_item(
     )
 
 
-def split_sentences(
-    text: str,
-) -> list[str]:
-    """
-    Sentence splitter designed for:
-        Tamil
-        Hindi
-        Latin punctuation
-        numbered-list passages
-
-    Critical difference from the previous version:
-    numbered items are isolated as independent evidence units instead
-    of leaving:
-
-        1. Mercury
-        2. Venus
-        3. Earth
-        4. ...
-
-    inside one giant sentence.
-    """
-
-    raw = str(
-        text
-    ).replace(
-        "\r",
-        "\n",
-    ).strip()
+def split_sentences(text: str) -> list[str]:
+    raw = (
+        str(text)
+        .replace("\r", "\n")
+        .strip()
+    )
 
     if not raw:
         return []
 
-    # Put numbered / A-D list items on their own logical line.
+    # Split:
+    # 1. Mars ...
+    # 2. Venus ...
+    # into independent logical units.
     raw = _LIST_BOUNDARY_RE.sub(
         "\n",
         raw,
@@ -522,67 +694,94 @@ def split_sentences(
         if not line:
             continue
 
-        # Keep a complete numbered list item as one unit.
-        if is_list_item(
-            line
-        ):
-            sentences.append(
-                line
-            )
+        if is_list_item(line):
+            sentences.append(line)
             continue
 
-        parts = (
-            _NORMAL_SENTENCE_SPLIT_RE
-            .split(
-                line
-            )
-        )
-
-        for part in parts:
+        for part in _SENTENCE_SPLIT_RE.split(
+            line
+        ):
 
             part = " ".join(
                 part.split()
             ).strip()
 
             if part:
-                sentences.append(
-                    part
-                )
+                sentences.append(part)
 
-    if sentences:
-        return sentences
+    return sentences
 
-    normalized = " ".join(
-        raw.split()
+
+def candidate_evidence_units(
+    text: str,
+) -> list[str]:
+    """
+    Individual sentences + limited adjacent pairs.
+
+    Adjacent pairs are required for evidence such as:
+
+        1. Earth ...
+        2. It has one natural satellite, the Moon.
+
+    The relationship can otherwise be split across list items.
+    """
+
+    sentences = split_sentences(text)
+
+    if not sentences:
+        return []
+
+    result = list(sentences)
+
+    continuation_markers = (
+        "इसका ",
+        "इसके ",
+        "यह ",
+        "उसका ",
+        "அது ",
+        "இதன் ",
+        "இதற்கு ",
     )
 
-    return (
-        [normalized]
-        if normalized
-        else []
-    )
+    for idx in range(
+        len(sentences) - 1
+    ):
+
+        first = sentences[idx]
+        second = sentences[idx + 1]
+
+        should_pair = (
+            is_list_item(first)
+            or is_list_item(second)
+            or second.startswith(
+                continuation_markers
+            )
+        )
+
+        if not should_pair:
+            continue
+
+        combined = (
+            first
+            + " "
+            + second
+        )
+
+        if len(combined) <= 450:
+            result.append(combined)
+
+    return result
 
 
 # =============================================================================
-# SENTENCE SCORING
+# SUPPORT SCORING
 # =============================================================================
 
-def score_sentence(
+def support_for_unit(
     query: str,
-    sentence: str,
+    unit: str,
     language: str,
-) -> float:
-    """
-    Rank evidence sentences for a tiny extractive generator.
-
-    Rewards:
-        informative query coverage
-        multiple informative terms
-
-    Penalizes:
-        numbered distractor items
-        violation of explicit hard constraints
-    """
+) -> SupportSignal:
 
     (
         matched,
@@ -590,149 +789,112 @@ def score_sentence(
         coverage,
     ) = query_overlap_stats(
         query,
-        sentence,
+        unit,
         language,
     )
 
-    if total == 0:
-        return 0.0
+    anchors_ok = anchors_satisfied(
+        query,
+        unit,
+        language,
+    )
 
-    if matched == 0:
-        return 0.0
+    constraints_ok = (
+        hard_constraints_satisfied(
+            query,
+            unit,
+            language,
+        )
+    )
+
+    contradiction = (
+        has_query_contradiction(
+            query,
+            unit,
+            language,
+        )
+    )
+
 
     score = (
-        coverage
-        *
-        10.0
-    )
-
-    # Reward evidence where multiple parts of the question
-    # co-occur inside one sentence.
-    score += (
-        min(
-            matched,
-            3,
-        )
-        *
-        0.40
-    )
-
-    if not hard_constraints_satisfied(
-        query,
-        sentence,
-        language,
-    ):
-        score -= 4.0
-
-    if is_list_item(
-        sentence
-    ):
-        score -= 0.75
-
-    # Extra penalty if badly formatted text still contains many items.
-    numbered_items = len(
-        re.findall(
-            r"(?:^|\s)\d{1,2}[\.\)]\s+",
-            sentence,
-        )
-    )
-
-    if numbered_items >= 2:
-        score -= (
-            1.5
-            *
-            (
-                numbered_items
-                -
-                1
-            )
-        )
-
-    return max(
-        score,
-        0.0,
-    )
-
-
-def evidence_pack_score(
-    query: str,
-    text: str,
-    language: str,
-) -> float:
-    """
-    Score an already-retrieved child for context packing.
-
-    The best individual sentence matters much more than broad
-    passage-level overlap.
-    """
-
-    sentences = split_sentences(
-        text
-    )
-
-    if not sentences:
-        return 0.0
-
-    best_sentence_score = max(
-        score_sentence(
-            query,
-            sentence,
-            language,
-        )
-        for sentence
-        in sentences
-    )
-
-    passage_coverage = (
-        evidence_relevance_score(
-            query,
-            text,
-            language,
-        )
-    )
-
-    return (
-        best_sentence_score
+        coverage * 10.0
         +
-        1.5
-        *
-        passage_coverage
+        min(matched, 3) * 0.4
+    )
+
+    if anchors_ok:
+        score += 1.0
+    else:
+        score -= 7.0
+
+    if not constraints_ok:
+        score -= 7.0
+
+    if contradiction:
+        score -= 10.0
+
+
+    strong = False
+
+    if (
+        total > 0
+        and anchors_ok
+        and constraints_ok
+        and not contradiction
+    ):
+
+        if total <= 2:
+
+            strong = (
+                matched == total
+            )
+
+        elif total == 3:
+
+            strong = (
+                matched >= 2
+                and coverage >= 0.66
+            )
+
+        else:
+
+            strong = (
+                matched >= 3
+                and coverage >= 0.55
+            )
+
+
+        if (
+            is_list_item(unit)
+            and coverage < 0.60
+        ):
+            strong = False
+
+
+    return SupportSignal(
+        strong=strong,
+        score=max(score, 0.0),
+        coverage=coverage,
+        matched_terms=matched,
+        total_terms=total,
+        unit=unit,
+        anchors_ok=anchors_ok,
+        constraints_ok=constraints_ok,
+        contradiction=contradiction,
     )
 
 
-# =============================================================================
-# STRONG SUPPORT DETECTION
-# =============================================================================
-
-def strongest_supporting_sentence(
+def strongest_supporting_unit(
     query: str,
     text: str,
     language: str,
 ) -> SupportSignal:
-    """
-    Find the best sentence and decide whether it is strong enough
-    to switch the generator from:
 
-        "answer or NOT_FOUND"
-
-    into:
-
-        "the evidence contains the answer; extract it"
-
-    This is deliberately conservative.
-
-    Strong support requires:
-    - query terms co-occurring in ONE sentence,
-    - hard constraints satisfied,
-    - sufficient informative overlap,
-    - stronger requirements for numbered-list items.
-    """
-
-    sentences = split_sentences(
+    units = candidate_evidence_units(
         text
     )
 
-    if not sentences:
+    if not units:
 
         return SupportSignal(
             strong=False,
@@ -740,109 +902,614 @@ def strongest_supporting_sentence(
             coverage=0.0,
             matched_terms=0,
             total_terms=0,
-            sentence="",
-            list_item=False,
+            unit="",
+            anchors_ok=False,
+            constraints_ok=False,
+            contradiction=False,
         )
 
-    best_signal: SupportSignal | None = None
 
-    for sentence in sentences:
+    signals = [
+        support_for_unit(
+            query,
+            unit,
+            language,
+        )
+        for unit in units
+    ]
 
+
+    return max(
+        signals,
+        key=lambda signal: (
+            signal.strong,
+            signal.score,
+            signal.coverage,
+            signal.matched_terms,
+        ),
+    )
+
+
+def evidence_relevance_score(
+    query: str,
+    text: str,
+    language: str,
+) -> float:
+
+    (
+        _,
+        _,
+        coverage,
+    ) = query_overlap_stats(
+        query,
+        text,
+        language,
+    )
+
+    return coverage
+
+
+def evidence_pack_score(
+    query: str,
+    text: str,
+    language: str,
+) -> float:
+
+    signal = strongest_supporting_unit(
+        query,
+        text,
+        language,
+    )
+
+    # Wrong subject / explicit contradiction should not win
+    # context packing even if lexical overlap is high.
+    if (
+        not signal.anchors_ok
+        or not signal.constraints_ok
+        or signal.contradiction
+    ):
+        return 0.0
+
+    return (
+        signal.score
+        +
         (
-            matched,
-            total,
-            coverage,
-        ) = query_overlap_stats(
-            query,
-            sentence,
-            language,
+            15.0
+            if signal.strong
+            else 0.0
+        )
+    )
+
+
+# =============================================================================
+# GROUNDED ANSWER CANDIDATE EXTRACTION
+# =============================================================================
+
+def _clean_candidate(
+    candidate: str,
+    query: str,
+    language: str,
+) -> str | None:
+
+    candidate = (
+        str(candidate)
+        .strip()
+        .strip(
+            " \t\r\n"
+            "\"'“”‘’"
+            "-–—:;,."
+            "।()[]{}"
+        )
+    )
+
+    candidate = _LIST_ITEM_RE.sub(
+        "",
+        candidate,
+    ).strip()
+
+
+    if not candidate:
+        return None
+
+
+    terms = split_terms(candidate)
+
+    if not terms:
+        return None
+
+
+    if len(terms) > 6:
+        return None
+
+
+    query_terms = split_terms(query)
+
+    all_query_echo = all(
+        any(
+            term_matches(
+                answer_term,
+                query_term,
+            )
+            for query_term in query_terms
+        )
+        for answer_term in terms
+    )
+
+    if all_query_echo:
+        return None
+
+
+    if len(candidate) > 80:
+        return None
+
+
+    return candidate
+
+
+def _strip_query_prefix_terms(
+    phrase: str,
+    query: str,
+) -> str:
+
+    terms = split_terms(phrase)
+
+    query_terms = split_terms(query)
+
+    while terms:
+
+        first = terms[0]
+
+        if any(
+            term_matches(
+                first,
+                q,
+            )
+            for q in query_terms
+        ):
+
+            terms.pop(0)
+
+        else:
+            break
+
+    return " ".join(terms)
+
+
+def extract_answer_candidate(
+    query: str,
+    unit: str,
+    language: str,
+) -> AnswerCandidate | None:
+    """
+    Extract only when the evidence syntax gives us a defensible span.
+
+    This is NOT a knowledge lookup.
+
+    Every candidate is copied from the supplied evidence.
+    """
+
+    if not unit:
+        return None
+
+    normalized = " ".join(
+        str(unit).split()
+    )
+
+
+    # -----------------------------------------------------------------
+    # NUMERIC + UNIT
+    # -----------------------------------------------------------------
+
+    query_cf = query.casefold()
+
+    if (
+        "செல்சியஸ்" in query_cf
+        or "°c" in query_cf
+    ):
+
+        match = re.search(
+            r"\b\d+(?:[.,]\d+)?\s*"
+            r"(?:டிகிரி\s*)?"
+            r"(?:செல்சியஸ்|°c)",
+            normalized,
+            re.IGNORECASE,
         )
 
-        score = score_sentence(
-            query,
-            sentence,
-            language,
-        )
+        if match:
 
-        list_item = is_list_item(
-            sentence
-        )
-
-        constraints_ok = (
-            hard_constraints_satisfied(
+            candidate = _clean_candidate(
+                match.group(0),
                 query,
-                sentence,
                 language,
             )
-        )
 
-        strong = False
+            if candidate:
 
-        if (
-            total > 0
-            and
-            constraints_ok
-        ):
-
-            # Very short factual questions:
-            # require all informative terms.
-            if total <= 2:
-
-                strong = (
-                    matched
-                    ==
-                    total
-                    and
-                    coverage >= 0.99
+                return AnswerCandidate(
+                    candidate,
+                    1.0,
+                    "numeric_unit",
                 )
 
-            else:
 
-                strong = (
-                    matched >= 2
-                    and
-                    coverage >= 0.50
-                )
+    if (
+        "सेल्सियस" in query_cf
+        or "°c" in query_cf
+    ):
 
-            # A list item is especially dangerous for a 0.6B model.
-            # Only treat it as strong if almost the entire question
-            # aligns with that same item.
-            if (
-                list_item
-                and
-                coverage < 0.80
-            ):
-                strong = False
-
-        signal = SupportSignal(
-            strong=strong,
-            score=score,
-            coverage=coverage,
-            matched_terms=matched,
-            total_terms=total,
-            sentence=sentence,
-            list_item=list_item,
+        match = re.search(
+            r"\b\d+(?:[.,]\d+)?\s*"
+            r"(?:डिग्री\s*)?"
+            r"(?:सेल्सियस|°c)",
+            normalized,
+            re.IGNORECASE,
         )
 
-        if (
-            best_signal is None
-            or
-            (
-                signal.strong,
-                signal.score,
-                signal.coverage,
-                signal.matched_terms,
+        if match:
+
+            candidate = _clean_candidate(
+                match.group(0),
+                query,
+                language,
             )
-            >
-            (
-                best_signal.strong,
-                best_signal.score,
-                best_signal.coverage,
-                best_signal.matched_terms,
+
+            if candidate:
+
+                return AnswerCandidate(
+                    candidate,
+                    1.0,
+                    "numeric_unit",
+                )
+
+
+    # -----------------------------------------------------------------
+    # HINDI HIGH-CONFIDENCE RELATION PATTERNS
+    # -----------------------------------------------------------------
+
+    if language == "hi":
+
+        # रक्त को पंप करने वाला हृदय है
+        match = re.search(
+            r"पंप\s+करने\s+वाला\s+"
+            r"([^\s,।.;:()]{2,40})",
+            normalized,
+            re.IGNORECASE,
+        )
+
+        if match:
+
+            candidate = _clean_candidate(
+                match.group(1),
+                query,
+                language,
             )
+
+            if candidate:
+
+                return AnswerCandidate(
+                    candidate,
+                    1.0,
+                    "pump_relation",
+                )
+
+
+        # ... प्राकृतिक उपग्रह है, चंद्रमा
+        match = re.search(
+            r"उपग्रह\s+"
+            r"(?:है\s*)?"
+            r"[,:\-–—]?\s*"
+            r"([^\s,।.;:()]{2,40})",
+            normalized,
+            re.IGNORECASE,
+        )
+
+        if match:
+
+            value = match.group(1)
+
+            if value not in {
+                "है",
+                "का",
+                "की",
+                "के",
+            }:
+
+                candidate = _clean_candidate(
+                    value,
+                    query,
+                    language,
+                )
+
+                if candidate:
+
+                    return AnswerCandidate(
+                        candidate,
+                        1.0,
+                        "satellite_relation",
+                    )
+
+
+        # भारत की राजधानी दिल्ली में...
+        match = re.search(
+            r"राजधानी\s+"
+            r"(?:है\s+)?"
+            r"([^\s,।.;:()]{2,40})",
+            normalized,
+            re.IGNORECASE,
+        )
+
+        if match:
+
+            candidate = _clean_candidate(
+                match.group(1),
+                query,
+                language,
+            )
+
+            if candidate:
+
+                return AnswerCandidate(
+                    candidate,
+                    0.95,
+                    "capital_relation",
+                )
+
+
+        # X गैस
+        if "गैस" in query_cf:
+
+            match = re.search(
+                r"((?:\S+\s+){0,3}\S+)"
+                r"\s+गैस(?:\s|$)",
+                normalized,
+                re.IGNORECASE,
+            )
+
+            if match:
+
+                phrase = _strip_query_prefix_terms(
+                    match.group(1),
+                    query,
+                )
+
+                candidate = _clean_candidate(
+                    phrase,
+                    query,
+                    language,
+                )
+
+                if candidate:
+
+                    return AnswerCandidate(
+                        candidate,
+                        0.95,
+                        "gas_relation",
+                    )
+
+
+    # -----------------------------------------------------------------
+    # TAMIL HIGH-CONFIDENCE RELATION PATTERNS
+    # -----------------------------------------------------------------
+
+    if language == "ta":
+
+        # இதயம் என்பது ...
+        match = re.match(
+            r"^\s*"
+            r"(.{1,60}?)"
+            r"\s+என்பது\b",
+            normalized,
+        )
+
+        if match:
+
+            candidate = _clean_candidate(
+                match.group(1),
+                query,
+                language,
+            )
+
+            if candidate:
+
+                return AnswerCandidate(
+                    candidate,
+                    1.0,
+                    "tamil_copula",
+                )
+
+
+        # ... கார்பன் டை ஆக்சைடு வாயுவை ...
+        if "வாயு" in query_cf:
+
+            match = re.search(
+                r"((?:\S+\s+){0,4}\S+)"
+                r"\s+வாயு(?:வை|வாக|வில்|$)",
+                normalized,
+            )
+
+            if match:
+
+                phrase = _strip_query_prefix_terms(
+                    match.group(1),
+                    query,
+                )
+
+                terms = split_terms(
+                    phrase
+                )
+
+                # Answer gases are usually compact.
+                if len(terms) > 3:
+                    terms = terms[-3:]
+
+                phrase = " ".join(
+                    terms
+                )
+
+                candidate = _clean_candidate(
+                    phrase,
+                    query,
+                    language,
+                )
+
+                if candidate:
+
+                    return AnswerCandidate(
+                        candidate,
+                        1.0,
+                        "gas_relation",
+                    )
+
+
+        match = re.search(
+            r"தலைநகர(?:ம்|மாக)\s+"
+            r"([^\s,.;:()]{2,50})",
+            normalized,
+        )
+
+        if match:
+
+            candidate = _clean_candidate(
+                match.group(1),
+                query,
+                language,
+            )
+
+            if candidate:
+
+                return AnswerCandidate(
+                    candidate,
+                    0.95,
+                    "capital_relation",
+                )
+
+
+        match = re.search(
+            r"துணைக்கோள்"
+            r"(?:\s+ஆகும்|\s+உள்ளது|\s+என்பது)?"
+            r"\s*[,:\-–—]?\s*"
+            r"([^\s,.;:()]{2,50})",
+            normalized,
+        )
+
+        if match:
+
+            candidate = _clean_candidate(
+                match.group(1),
+                query,
+                language,
+            )
+
+            if candidate:
+
+                return AnswerCandidate(
+                    candidate,
+                    0.95,
+                    "satellite_relation",
+                )
+
+
+    # -----------------------------------------------------------------
+    # NUMBERED LIST:
+    #
+    # 3. मंगल - ...
+    # 1. செவ்வாய் - ...
+    # -----------------------------------------------------------------
+
+    match = _LIST_HEAD_RE.match(
+        normalized
+    )
+
+    if match:
+
+        candidate = _clean_candidate(
+            match.group(1),
+            query,
+            language,
+        )
+
+        if candidate:
+
+            return AnswerCandidate(
+                candidate,
+                0.95,
+                "list_head",
+            )
+
+
+    # -----------------------------------------------------------------
+    # GENERIC LEADING ANSWER
+    #
+    # त्वचा मानव शरीर का सबसे बड़ा अंग है
+    # बृहस्पति सौर मंडल का सबसे बड़ा ग्रह है
+    # प्रशांत महासागर विश्व का सबसे बड़ा महासागर है
+    #
+    # Only MEDIUM confidence. Used mainly to repair abstention/truncation.
+    # -----------------------------------------------------------------
+
+    stripped = _LIST_ITEM_RE.sub(
+        "",
+        normalized,
+    ).strip()
+
+    words = stripped.split()
+
+    informative = informative_query_terms(
+        query,
+        language,
+    )
+
+    first_query_word_index = None
+
+    for idx, word in enumerate(words):
+
+        word_terms = split_terms(
+            word
+        )
+
+        if not word_terms:
+            continue
+
+        if any(
+            any(
+                term_matches(
+                    word_term,
+                    query_term,
+                )
+                for query_term in informative
+            )
+            for word_term in word_terms
         ):
-            best_signal = signal
 
-    assert best_signal is not None
+            first_query_word_index = idx
+            break
 
-    return best_signal
+
+    if (
+        first_query_word_index is not None
+        and
+        1 <= first_query_word_index <= 4
+    ):
+
+        phrase = " ".join(
+            words[
+                :first_query_word_index
+            ]
+        )
+
+        candidate = _clean_candidate(
+            phrase,
+            query,
+            language,
+        )
+
+        if candidate:
+
+            return AnswerCandidate(
+                candidate,
+                0.65,
+                "leading_entity",
+            )
+
+
+    return None

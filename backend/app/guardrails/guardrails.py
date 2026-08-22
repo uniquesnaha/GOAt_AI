@@ -1,13 +1,16 @@
 """
-Deterministic guardrails around GOAt AI RAG.
+Deterministic input/output guardrails for GOAt AI.
 
-Objectives:
-- no extra LLM call,
-- preserve latency,
-- allow correct grounded short answers,
-- reject distractor-list hallucinations,
-- reject answers whose requested unit/modifier is unsupported,
-- preserve strict NOT_FOUND behavior when evidence is genuinely weak.
+No additional model call.
+
+The output policy is:
+
+1. Determine whether packed evidence truly supports the question.
+2. Reject wrong-subject / contradictory evidence.
+3. Prefer a high-confidence answer span copied directly from strong evidence.
+4. Otherwise accept Qwen output only if it is grounded in strong evidence.
+5. A token-limit hit is telemetry, NOT automatic rejection.
+6. If nothing is defensibly supported -> NOT_FOUND.
 """
 
 from __future__ import annotations
@@ -19,24 +22,20 @@ from dataclasses import dataclass
 from typing import Optional
 
 from app.rag.evidence_quality import (
-    hard_constraints_satisfied,
-    informative_query_terms,
-    is_list_item,
-    query_overlap_stats,
-    split_sentences,
+    candidate_evidence_units,
+    extract_answer_candidate,
     split_terms,
+    strongest_supporting_unit,
+    support_for_unit,
     term_matches,
 )
 
-
-# =============================================================================
-# BASIC CONFIG
-# =============================================================================
 
 SUPPORTED_LANGUAGES = {
     "ta",
     "hi",
 }
+
 
 MAX_QUERY_CHARS = 500
 
@@ -59,18 +58,6 @@ DEFAULT_NOT_FOUND_MESSAGE = (
 )
 
 
-# =============================================================================
-# REGEX
-# =============================================================================
-
-_CITATION_RE = re.compile(
-    r"\[\s*\d+\s*\]"
-)
-
-_CITATION_ONLY_RE = re.compile(
-    r"^(?:\s*\[\s*\d+\s*\]\s*)+$"
-)
-
 _TARGET_SCRIPT = {
     "ta":
         re.compile(
@@ -84,10 +71,13 @@ _TARGET_SCRIPT = {
 }
 
 
-_NUMERIC_ANSWER_RE = re.compile(
-    r"^[\s\d.,:+\-−°%/]+"
-    r"(?:f|c|°c|°f|km|kg|m|cm|mm)?$",
-    re.IGNORECASE,
+_CITATION_RE = re.compile(
+    r"\[\s*\d+\s*\]"
+)
+
+
+_CITATION_ONLY_RE = re.compile(
+    r"^(?:\s*\[\s*\d+\s*\]\s*)+$"
 )
 
 
@@ -101,10 +91,6 @@ _ANSWER_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
-
-# =============================================================================
-# MINIMAL SAFETY NET
-# =============================================================================
 
 _UNSAFE_PATTERNS = [
     re.compile(
@@ -130,10 +116,6 @@ _UNSAFE_PATTERNS = [
 ]
 
 
-# =============================================================================
-# RESULT TYPE
-# =============================================================================
-
 @dataclass
 class GuardrailResult:
     allowed: bool
@@ -151,15 +133,12 @@ def check_input(
     language: str,
 ) -> GuardrailResult:
 
-    stage = (
-        "input"
-    )
+    stage = "input"
 
 
     if (
         not query
-        or
-        not query.strip()
+        or not query.strip()
     ):
 
         return GuardrailResult(
@@ -170,11 +149,7 @@ def check_input(
         )
 
 
-    if (
-        len(query)
-        >
-        MAX_QUERY_CHARS
-    ):
+    if len(query) > MAX_QUERY_CHARS:
 
         return GuardrailResult(
             False,
@@ -204,9 +179,7 @@ def check_input(
         )
 
 
-    for pattern in (
-        _UNSAFE_PATTERNS
-    ):
+    for pattern in _UNSAFE_PATTERNS:
 
         if pattern.search(
             query
@@ -235,11 +208,6 @@ def check_grounding(
     context: str,
 ) -> GuardrailResult:
 
-    stage = (
-        "grounding"
-    )
-
-
     if (
         not parents
         or
@@ -248,7 +216,7 @@ def check_grounding(
 
         return GuardrailResult(
             False,
-            stage,
+            "grounding",
             "no_grounded_context",
             (
                 "Retrieval returned no usable "
@@ -259,66 +227,13 @@ def check_grounding(
 
     return GuardrailResult(
         True,
-        stage,
+        "grounding",
     )
 
 
 # =============================================================================
-# CLEANING
+# ANSWER CLEANING
 # =============================================================================
-
-def _terms(
-    text: str,
-) -> list[str]:
-
-    terms = []
-    current = []
-
-    for char in str(
-        text
-    ).casefold():
-
-        category = (
-            unicodedata.category(
-                char
-            )
-        )
-
-        if (
-            category
-            and
-            category[0]
-            in {
-                "L",
-                "M",
-                "N",
-            }
-        ):
-
-            current.append(
-                char
-            )
-
-        elif current:
-
-            terms.append(
-                "".join(
-                    current
-                )
-            )
-
-            current = []
-
-    if current:
-
-        terms.append(
-            "".join(
-                current
-            )
-        )
-
-    return terms
-
 
 def _clean_answer(
     answer: str,
@@ -328,310 +243,297 @@ def _clean_answer(
         answer
     ).strip()
 
-    cleaned = (
-        cleaned.replace(
-            "**",
-            "",
-        )
+
+    cleaned = cleaned.replace(
+        "**",
+        "",
     )
 
-    cleaned = (
-        _CITATION_RE.sub(
-            "",
-            cleaned,
-        )
+
+    cleaned = _CITATION_RE.sub(
+        "",
+        cleaned,
     )
 
-    cleaned = (
-        _MCQ_PREFIX_RE.sub(
-            "",
-            cleaned,
-        )
+
+    cleaned = _MCQ_PREFIX_RE.sub(
+        "",
+        cleaned,
     )
 
-    cleaned = (
-        _ANSWER_PREFIX_RE.sub(
-            "",
-            cleaned,
-        )
+
+    cleaned = _ANSWER_PREFIX_RE.sub(
+        "",
+        cleaned,
     )
 
-    cleaned = (
-        cleaned.replace(
-            "\ufffd",
-            "",
-        )
+
+    cleaned = cleaned.replace(
+        "\ufffd",
+        "",
     )
+
+
+    # 0.6B sometimes continues:
+    #
+    # "हृदय। क्योंकि..."
+    #
+    # We only need first answer fragment.
+    cleaned = re.split(
+        r"[\n\r]|(?<=[।.!?])\s+",
+        cleaned,
+        maxsplit=1,
+    )[0]
+
 
     cleaned = " ".join(
         cleaned.split()
     )
 
+
     return cleaned.strip(
-        " -–—:;,.|"
+        " -–—:;,.|।"
     )
 
 
 # =============================================================================
-# ANSWER → SENTENCE MATCHING
+# ANSWER CONTAINMENT
 # =============================================================================
 
-def _answer_is_inside_sentence(
+def _answer_inside_unit(
     answer: str,
-    sentence: str,
+    unit: str,
 ) -> bool:
-    """
-    Require substantially stronger containment than the old
-    "ANY answer term appears" rule.
-
-    Multi-word answer:
-        all meaningful answer terms must appear morphologically.
-
-    Numeric answer:
-        all answer numbers must be present.
-    """
 
     answer_cf = (
         answer.casefold()
     )
 
-    sentence_cf = (
-        sentence.casefold()
+    unit_cf = (
+        unit.casefold()
     )
 
 
-    # Best case: exact phrase.
     if (
         answer_cf
         and
-        answer_cf
-        in
-        sentence_cf
+        answer_cf in unit_cf
     ):
         return True
 
 
-    answer_digits = set(
-        re.findall(
-            r"\d+",
-            answer_cf,
-        )
-    )
-
-    sentence_digits = set(
-        re.findall(
-            r"\d+",
-            sentence_cf,
-        )
-    )
-
-
-    if answer_digits:
-
-        if not answer_digits.issubset(
-            sentence_digits
-        ):
-            return False
-
-
     answer_terms = [
         term
-        for term
-        in split_terms(
+        for term in split_terms(
             answer
         )
         if len(term) >= 2
     ]
 
 
-    # Pure numeric answer.
-    if (
-        answer_digits
-        and
-        not answer_terms
-    ):
-        return True
+    unit_terms = split_terms(
+        unit
+    )
 
 
     if not answer_terms:
         return False
 
 
-    sentence_terms = (
-        split_terms(
-            sentence
-        )
-    )
-
-
-    # Require ALL meaningful answer terms, not merely one.
-    for answer_term in (
-        answer_terms
-    ):
-
-        if not any(
+    # Every meaningful answer term must be supported.
+    return all(
+        any(
             term_matches(
                 answer_term,
-                sentence_term,
+                unit_term,
             )
-
-            for sentence_term
-            in sentence_terms
-        ):
-
-            return False
-
-
-    return True
-
-
-# =============================================================================
-# CONTEXT SUPPORT VALIDATION
-# =============================================================================
-
-def _supported_by_context(
-    answer: str,
-    context: str,
-    query: str = "",
-    language: str = "ta",
-) -> bool:
-    """
-    Grounding validation at sentence/list-item level.
-
-    A generated answer is accepted only when one evidence unit:
-    1. actually contains the answer,
-    2. substantially aligns with the question,
-    3. satisfies explicit question constraints,
-    4. is not merely an unrelated numbered-list distractor.
-    """
-
-    sentences = (
-        split_sentences(
-            context
+            for unit_term in unit_terms
         )
+        for answer_term in answer_terms
     )
 
-    if not sentences:
+
+def _answer_supported(
+    answer: str,
+    query: str,
+    context: str,
+    language: str,
+) -> bool:
+    """
+    Accept an answer only if the same evidence unit:
+    - strongly supports the question, AND
+    - contains the answer.
+    """
+
+    if not answer:
         return False
 
 
-    query_terms = (
-        informative_query_terms(
+    for unit in candidate_evidence_units(
+        context
+    ):
+
+        signal = support_for_unit(
             query,
+            unit,
             language,
         )
-    )
 
 
-    for sentence in sentences:
+        if not signal.strong:
+            continue
 
 
-        # ---------------------------------------------------------
-        # The answer itself must actually occur here.
-        # ---------------------------------------------------------
-
-        if not _answer_is_inside_sentence(
+        if _answer_inside_unit(
             answer,
-            sentence,
+            unit,
         ):
-            continue
 
-
-        # ---------------------------------------------------------
-        # Explicit unit / national / only / superlative constraints.
-        # ---------------------------------------------------------
-
-        if not hard_constraints_satisfied(
-            query,
-            sentence,
-            language,
-        ):
-            continue
-
-
-        (
-            matched,
-            total,
-            coverage,
-        ) = (
-            query_overlap_stats(
-                query,
-                sentence,
-                language,
-            )
-        )
-
-
-        # ---------------------------------------------------------
-        # No informative query terms:
-        # answer containment is enough.
-        # ---------------------------------------------------------
-
-        if total == 0:
             return True
-
-
-        # ---------------------------------------------------------
-        # Very short query:
-        # require every meaningful concept.
-        # ---------------------------------------------------------
-
-        if total <= 2:
-
-            query_supported = (
-                matched
-                ==
-                total
-            )
-
-
-        else:
-
-            # Multiple terms:
-            # require at least two informative matches and
-            # meaningful overall coverage.
-            query_supported = (
-                matched >= 2
-                and
-                coverage >= 0.40
-            )
-
-
-        if not query_supported:
-            continue
-
-
-        # ---------------------------------------------------------
-        # Numbered-list distractor protection.
-        #
-        # Example:
-        #
-        # 1. Mercury ...
-        # 2. Venus ...
-        # 3. Earth ...
-        #
-        # "Mercury" cannot pass just because it appears somewhere
-        # in the retrieved list.
-        # ---------------------------------------------------------
-
-        if (
-            is_list_item(
-                sentence
-            )
-            and
-            coverage < 0.67
-        ):
-            continue
-
-
-        return True
 
 
     return False
 
 
 # =============================================================================
-# REJECTION
+# ANSWER SHAPE
+# =============================================================================
+
+def _question_echo(
+    answer: str,
+    query: str,
+) -> bool:
+
+    answer_terms = split_terms(
+        answer
+    )
+
+    query_terms = split_terms(
+        query
+    )
+
+
+    if not answer_terms:
+        return True
+
+
+    has_novel_term = any(
+        not any(
+            term_matches(
+                answer_term,
+                query_term,
+            )
+            for query_term in query_terms
+        )
+        for answer_term in answer_terms
+    )
+
+
+    return not has_novel_term
+
+
+def _script_ok(
+    answer: str,
+    language: str,
+) -> bool:
+
+    target = _TARGET_SCRIPT.get(
+        language
+    )
+
+
+    if (
+        target
+        and target.search(
+            answer
+        )
+    ):
+        return True
+
+
+    # Numbers and standard scientific Latin notation are okay.
+    if re.search(
+        r"[A-Za-z0-9°%]",
+        answer,
+    ):
+        return True
+
+
+    return False
+
+
+def _repetition_bad(
+    answer: str,
+) -> bool:
+
+    terms = split_terms(
+        answer
+    )
+
+
+    for (
+        left,
+        middle,
+        right,
+    ) in zip(
+        terms,
+        terms[1:],
+        terms[2:],
+    ):
+
+        if (
+            left
+            ==
+            middle
+            ==
+            right
+        ):
+
+            return True
+
+
+    return False
+
+
+def _candidate_shape_ok(
+    candidate: str,
+    query: str,
+    language: str,
+) -> bool:
+
+    if not candidate:
+        return False
+
+
+    if len(candidate) > 90:
+        return False
+
+
+    if _question_echo(
+        candidate,
+        query,
+    ):
+        return False
+
+
+    if not _script_ok(
+        candidate,
+        language,
+    ):
+        return False
+
+
+    if _repetition_bad(
+        candidate
+    ):
+        return False
+
+
+    return True
+
+
+# =============================================================================
+# OUTPUT REJECTION
 # =============================================================================
 
 def _localized_rejection(
@@ -650,6 +552,7 @@ def _localized_rejection(
         )
     )
 
+
     return (
         message,
 
@@ -663,7 +566,7 @@ def _localized_rejection(
 
 
 # =============================================================================
-# OUTPUT
+# OUTPUT GUARDRAIL + EVIDENCE SPAN REPAIR
 # =============================================================================
 
 def apply_output_guardrail(
@@ -678,309 +581,259 @@ def apply_output_guardrail(
     str,
     GuardrailResult,
 ]:
-    """
-    Deterministic output validation.
 
-    Adds effectively negligible latency.
-    """
-
-    stage = (
-        "output"
-    )
-
-
-    stripped = str(
+    raw = str(
         answer
     ).strip()
 
 
-    # ---------------------------------------------------------
-    # MODEL ABSTENTION
-    # ---------------------------------------------------------
+    # -----------------------------------------------------------------
+    # First inspect evidence itself.
+    # -----------------------------------------------------------------
+
+    support = (
+        strongest_supporting_unit(
+            query,
+            context,
+            language,
+        )
+    )
+
+
+    evidence_candidate = None
+
+
+    if support.strong:
+
+        evidence_candidate = (
+            extract_answer_candidate(
+                query,
+                support.unit,
+                language,
+            )
+        )
+
+
+    # -----------------------------------------------------------------
+    # HIGH-CONFIDENCE EVIDENCE REPAIR
+    #
+    # This is what fixes:
+    #
+    #   heart
+    #   CO2
+    #   Moon
+    #   Mars/red planet
+    #   Delhi
+    #   boiling point
+    #
+    # even when 0.6B rambles, echoes, truncates or abstains.
+    #
+    # The candidate is always copied from the strongly supported evidence.
+    # -----------------------------------------------------------------
 
     if (
-        stripped
-        ==
-        NOT_FOUND_SENTINEL
+        evidence_candidate is not None
+        and
+        evidence_candidate.confidence >= 0.90
+    ):
+
+        candidate = (
+            evidence_candidate.text
+        )
+
+
+        if (
+            _candidate_shape_ok(
+                candidate,
+                query,
+                language,
+            )
+            and
+            _answer_supported(
+                candidate,
+                query,
+                context,
+                language,
+            )
+        ):
+
+            return (
+                candidate,
+
+                GuardrailResult(
+                    True,
+                    "output",
+                ),
+            )
+
+
+    # -----------------------------------------------------------------
+    # MODEL ABSTENTION
+    # -----------------------------------------------------------------
+
+    model_abstained = (
+        raw == NOT_FOUND_SENTINEL
         or
-        stripped.startswith(
+        raw.startswith(
             NOT_FOUND_SENTINEL
         )
-    ):
+    )
 
-        code = (
-            "model_abstained_on_strong_evidence"
-            if strong_evidence
-            else "model_abstained"
+
+    cleaned = (
+        ""
+        if model_abstained
+        else
+        _clean_answer(
+            raw
         )
-
-        reason = (
-            "Model reported NOT_FOUND despite strong packed evidence."
-            if strong_evidence
-            else "Model reported NOT_FOUND."
-        )
-
-        return _localized_rejection(
-            language,
-            code,
-            reason,
-        )
+    )
 
 
-    # ---------------------------------------------------------
-    # EMPTY
-    # ---------------------------------------------------------
+    # -----------------------------------------------------------------
+    # Accept the actual model answer if grounded.
+    #
+    # IMPORTANT:
+    # `possibly_truncated` no longer causes automatic rejection.
+    #
+    # If the first answer fragment is already fully grounded, accept it.
+    # -----------------------------------------------------------------
 
-    if not stripped:
+    if cleaned:
 
-        return _localized_rejection(
-            language,
-            "empty_answer",
-            "Model returned an empty answer.",
-        )
+        if (
+            _candidate_shape_ok(
+                cleaned,
+                query,
+                language,
+            )
+            and
+            _answer_supported(
+                cleaned,
+                query,
+                context,
+                language,
+            )
+        ):
+
+            return (
+                cleaned,
+
+                GuardrailResult(
+                    True,
+                    "output",
+                ),
+            )
 
 
-    # ---------------------------------------------------------
-    # CITATION ONLY
-    # ---------------------------------------------------------
+    # -----------------------------------------------------------------
+    # MEDIUM-CONFIDENCE REPAIR
+    #
+    # Examples:
+    #
+    #   त्वचा मानव शरीर का सबसे बड़ा अंग है
+    #   -> त्वचा
+    #
+    #   बृहस्पति सौर मंडल का सबसे बड़ा ग्रह है
+    #   -> बृहस्पति
+    #
+    # Only used after model output itself failed.
+    # -----------------------------------------------------------------
 
     if (
-        _CITATION_ONLY_RE.fullmatch(
-            stripped
-        )
+        evidence_candidate is not None
+        and
+        evidence_candidate.confidence >= 0.60
     ):
+
+        candidate = (
+            evidence_candidate.text
+        )
+
+
+        if (
+            _candidate_shape_ok(
+                candidate,
+                query,
+                language,
+            )
+            and
+            _answer_supported(
+                candidate,
+                query,
+                context,
+                language,
+            )
+        ):
+
+            return (
+                candidate,
+
+                GuardrailResult(
+                    True,
+                    "output",
+                ),
+            )
+
+
+    # -----------------------------------------------------------------
+    # Nothing passed.
+    # Choose useful diagnostic code.
+    # -----------------------------------------------------------------
+
+    if model_abstained:
 
         return _localized_rejection(
             language,
-            "citation_only",
-            "Model returned a citation without an answer.",
+            "model_abstained",
+            (
+                "Model abstained and no "
+                "defensible grounded answer span "
+                "could be recovered."
+            ),
         )
 
-
-    # ---------------------------------------------------------
-    # TOKEN LIMIT
-    # ---------------------------------------------------------
 
     if possibly_truncated:
 
         return _localized_rejection(
             language,
-            "truncated_answer",
-            "Model output hit the token limit before completing.",
+            "truncated_unsupported",
+            (
+                "Generation reached its token budget "
+                "and no complete grounded answer span "
+                "could be validated."
+            ),
         )
 
 
-    cleaned = (
-        _clean_answer(
-            stripped
-        )
-    )
-
-
-    if not cleaned:
-
-        return _localized_rejection(
-            language,
-            "empty_answer",
-            "Model returned an empty answer after cleaning.",
-        )
-
-
-    # ---------------------------------------------------------
-    # LONG CONTEXT ECHO
-    # ---------------------------------------------------------
-
-    if (
-        context
-        and
-        len(cleaned)
-        >= 50
-        and
-        cleaned
-        in
-        context[
-            :160
-        ]
-    ):
-
-        return _localized_rejection(
-            language,
-            "context_echo",
-            "Model copied a long context fragment instead of extracting an answer.",
-        )
-
-
-    # ---------------------------------------------------------
-    # REPETITION
-    # ---------------------------------------------------------
-
-    answer_terms = (
-        _terms(
-            cleaned
-        )
-    )
-
-
-    for (
-        left,
-        middle,
-        right,
-    ) in zip(
-        answer_terms,
-        answer_terms[
-            1:
-        ],
-        answer_terms[
-            2:
-        ],
-    ):
-
-        if (
-            left
-            ==
-            middle
-            ==
-            right
-        ):
-
-            return _localized_rejection(
-                language,
-                "repeated_answer",
-                "Model output contains excessive repetition.",
-            )
-
-
-    # ---------------------------------------------------------
-    # QUESTION ECHO
-    # ---------------------------------------------------------
-
-    query_terms = set(
-        _terms(
-            query
-        )
-    )
-
-
-    meaningful_new = [
-        term
-        for term
-        in answer_terms
-
-        if (
-            term
-            not in
-            query_terms
-            and
-            len(term)
-            >= 4
-        )
-    ]
-
-
-    if (
-        answer_terms
-        and
-        not meaningful_new
-        and
-        set(
-            answer_terms
-        ).issubset(
-            query_terms
-        )
+    if cleaned and _question_echo(
+        cleaned,
+        query,
     ):
 
         return _localized_rejection(
             language,
             "question_echo",
-            "Model repeated the question instead of answering it.",
-        )
-
-
-    # ---------------------------------------------------------
-    # SCRIPT
-    # ---------------------------------------------------------
-
-    target_script = (
-        _TARGET_SCRIPT.get(
-            language
-        )
-    )
-
-
-    has_target_script = bool(
-        target_script
-        and
-        target_script.search(
-            cleaned
-        )
-    )
-
-
-    has_latin_or_numbers = bool(
-        re.search(
-            r"[a-zA-Z0-9]",
-            cleaned,
-        )
-    )
-
-
-    if not (
-        has_target_script
-        or
-        has_latin_or_numbers
-        or
-        _NUMERIC_ANSWER_RE
-        .fullmatch(
-            cleaned
-        )
-    ):
-
-        return _localized_rejection(
-            language,
-            "wrong_language",
-            "Model answered in an unsupported script.",
-        )
-
-
-    # ---------------------------------------------------------
-    # ACTUAL GROUNDING
-    # ---------------------------------------------------------
-
-    if (
-        context
-        and
-        not _supported_by_context(
-            cleaned,
-            context,
-            query=
-                query,
-            language=
-                language,
-        )
-    ):
-
-        return _localized_rejection(
-            language,
-            "unsupported_answer",
             (
-                "Generated answer is not supported by "
-                "a query-aligned evidence sentence."
+                "Model repeated question terms "
+                "instead of producing a grounded answer."
             ),
         )
 
 
-    return (
-        cleaned,
-
-        GuardrailResult(
-            True,
-            stage,
+    return _localized_rejection(
+        language,
+        "unsupported_answer",
+        (
+            "No generated or repaired answer span "
+            "was strongly supported by the packed evidence."
         ),
     )
 
 
 # =============================================================================
-# USER-FACING NOT FOUND
+# NOT FOUND MESSAGE
 # =============================================================================
 
 def not_found_response_text(
@@ -1018,4 +871,6 @@ class Guardrails:
     )
 
 
-guardrails = Guardrails()
+guardrails = (
+    Guardrails()
+)
